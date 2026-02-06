@@ -1,0 +1,35 @@
+# Runtime data
+/data/
+
+# Secrets
+.env
+.env.*
+*.secret
+*.local
+
+# Logs
+*.log
+logs/
+
+# Dependencies
+node_modules/
+
+# Build artifacts
+/dist/
+/build/
+
+# Caches
+.cache/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Backups / temp
+*.bak
+*.old
+*.tmp
+
+# OS
+.DS_Store

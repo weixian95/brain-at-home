@@ -1,0 +1,15 @@
+{
+  "name": "brain-at-home",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local Ollama gateway for tailnet access",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "start:tailnet": "node server.js & sudo tailscale serve --bg --http=3000 localhost:3000 && sudo tailscale serve status",
+    "stop:tailnet": "sudo tailscale serve --http=3000 localhost:3000 off && sudo tailscale serve status; pkill -f \"node server.js\" || true"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
