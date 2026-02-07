@@ -16,7 +16,7 @@ const {
   trimToCharBudget,
 } = require('../lib/utils')
 const { callOllamaChat, listOllamaModels } = require('../lib/ollama')
-const { shouldUseWebAgent } = require('../agent/classifier')
+// Web agent routing is controlled by client input (use_web/web_search).
 const { callWebAgent, streamWebAgent } = require('../agent/client')
 const { getWebAgentSystemPrompt } = require('../agent/prompt')
 
@@ -117,6 +117,8 @@ async function handleChat(req, res) {
     message_id: messageId,
     client_ts: clientTs,
     stream,
+    use_web: useWeb,
+    web_search: webSearch,
   } = payload
 
   const missing = []
@@ -155,6 +157,15 @@ async function handleChat(req, res) {
     const requestTs = Date.now()
     const messageTs = Number.isFinite(clientTs) ? clientTs : requestTs
 
+    if (useStream) {
+      startStreamResponse(res)
+      writeNdjson(res, {
+        stage: 'routing',
+        content: 'Selecting information acquisition strategy.',
+        done: false,
+      })
+    }
+
     const budgets = {
       summary: config.SUMMARY_TOKEN_BUDGET,
       facts: config.FACTS_TOKEN_BUDGET,
@@ -181,6 +192,7 @@ async function handleChat(req, res) {
         stream: false,
       })
       const answerTs = Date.now()
+      const sources = []
 
       await finalizeChatTurn({
         record,
@@ -195,18 +207,37 @@ async function handleChat(req, res) {
         if (!res.headersSent) {
           startStreamResponse(res)
         }
-        writeNdjson(res, { stage: 'fallback_local', reason, done: false })
-        writeNdjson(res, { stage: 'final_answer', content: answer, done: true })
+        writeNdjson(res, { stage: 'fallback_local', reason, sources, done: false })
+        writeNdjson(res, { stage: 'final_answer', content: answer, sources, done: true })
         if (!res.writableEnded) {
           res.end()
         }
         return
       }
 
-      respondJson(res, 200, { chat_id: chatId, answer })
+      respondJson(res, 200, { chat_id: chatId, answer, sources })
     }
 
-    const webDecision = shouldUseWebAgent(prompt)
+    const override = parseBooleanOverride(
+      typeof useWeb !== 'undefined' ? useWeb : webSearch
+    )
+    if (override === null) {
+      respondJson(res, 400, {
+        error: 'Missing use_web. Client must choose local vs web agent.',
+      })
+      return
+    }
+
+    const webDecision = { use: override, reasons: ['client_override'] }
+    if (useStream) {
+      writeNdjson(res, {
+        stage: 'routing_decision',
+        use_web: Boolean(webDecision && webDecision.use),
+        source: 'client',
+        reason: 'client_override',
+        done: false,
+      })
+    }
     if (webDecision.use) {
       const agentMessages = buildPromptMessages({
         systemPrompt: getWebAgentSystemPrompt(config.WEB_AGENT_SYSTEM_PROMPT),
@@ -226,7 +257,7 @@ async function handleChat(req, res) {
       if (useStream) {
         try {
           startStreamResponse(res)
-          const { answer, completed } = await streamWebAgent({
+          const { answer, sources, sawSources, completed } = await streamWebAgent({
             messages: agentMessages,
             prompt,
             userId,
@@ -244,6 +275,10 @@ async function handleChat(req, res) {
           if (!completed || !answer) {
             await respondWithLocalFallback('web agent failed', true)
             return
+          }
+
+          if (!sawSources && Array.isArray(sources) && sources.length && !res.writableEnded) {
+            writeNdjson(res, { stage: 'sources', sources, done: false })
           }
 
           const answerTs = Date.now()
@@ -269,7 +304,7 @@ async function handleChat(req, res) {
       }
 
       try {
-        const answer = await callWebAgent({
+        const { answer, sources } = await callWebAgent({
           messages: agentMessages,
           prompt,
           userId,
@@ -289,7 +324,7 @@ async function handleChat(req, res) {
           answerTs,
         })
 
-        respondJson(res, 200, { chat_id: chatId, answer })
+        respondJson(res, 200, { chat_id: chatId, answer, sources })
       } catch (error) {
         await respondWithLocalFallback(
           error instanceof Error ? error.message : 'web agent error',
@@ -375,6 +410,19 @@ function isNonEmptyString(value) {
 
 function isStreamRequested(value) {
   return value === true || value === 'true' || value === 1 || value === '1'
+}
+
+function parseBooleanOverride(value) {
+  if (value === undefined || value === null) return null
+  if (value === true || value === false) return value
+  if (value === 1 || value === '1') return true
+  if (value === 0 || value === '0') return false
+  if (typeof value === 'string') {
+    const lowered = value.trim().toLowerCase()
+    if (['true', 'yes', 'on'].includes(lowered)) return true
+    if (['false', 'no', 'off'].includes(lowered)) return false
+  }
+  return null
 }
 
 function getFirstUserPrompt(record, fallback) {

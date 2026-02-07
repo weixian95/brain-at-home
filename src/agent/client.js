@@ -20,6 +20,19 @@ function extractAnswer(payload) {
   return ''
 }
 
+function extractSources(payload) {
+  if (!payload || typeof payload !== 'object') return []
+  if (Array.isArray(payload.sources)) {
+    return payload.sources
+      .filter((source) => source && source.url)
+      .map((source) => ({
+        title: source.title || 'Untitled',
+        url: source.url,
+      }))
+  }
+  return []
+}
+
 async function callWebAgent({
   messages,
   prompt,
@@ -61,11 +74,12 @@ async function callWebAgent({
 
     const payload = await response.json()
     const answer = extractAnswer(payload)
+    const sources = extractSources(payload)
     if (!answer) {
       throw new Error('Web agent returned an empty response.')
     }
 
-    return answer
+    return { answer, sources }
   } catch (error) {
     if (error && error.name === 'AbortError') {
       throw new Error('Web agent request timed out.')
@@ -124,6 +138,8 @@ async function streamWebAgent({
     const reader = response.body.getReader()
     let buffer = ''
     let answer = ''
+    let sources = []
+    let sawSources = false
     let sawDone = false
 
     while (true) {
@@ -140,6 +156,18 @@ async function streamWebAgent({
           const parsed = JSON.parse(trimmed)
           if (parsed && parsed.stage === 'final_answer' && typeof parsed.content === 'string') {
             answer = parsed.content
+          }
+          if (parsed && Array.isArray(parsed.sources)) {
+            sources = parsed.sources
+              .filter((source) => source && source.url)
+              .map((source) => ({
+                title: source.title || 'Untitled',
+                url: source.url,
+              }))
+            sawSources = true
+          }
+          if (parsed && parsed.stage === 'sources') {
+            sawSources = true
           }
           if (parsed && parsed.done === true) {
             sawDone = true
@@ -160,6 +188,18 @@ async function streamWebAgent({
         if (parsed && parsed.stage === 'final_answer' && typeof parsed.content === 'string') {
           answer = parsed.content
         }
+        if (parsed && Array.isArray(parsed.sources)) {
+          sources = parsed.sources
+            .filter((source) => source && source.url)
+            .map((source) => ({
+              title: source.title || 'Untitled',
+              url: source.url,
+            }))
+          sawSources = true
+        }
+        if (parsed && parsed.stage === 'sources') {
+          sawSources = true
+        }
         if (parsed && parsed.done === true) {
           sawDone = true
         }
@@ -173,6 +213,8 @@ async function streamWebAgent({
 
     return {
       answer,
+      sources,
+      sawSources,
       completed: !aborted && (sawDone || answer.length > 0),
     }
   } catch (error) {

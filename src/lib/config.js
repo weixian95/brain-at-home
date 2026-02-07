@@ -40,6 +40,7 @@ const config = {
   ),
   WEB_AGENT_SYSTEM_PROMPT: process.env.WEB_AGENT_SYSTEM_PROMPT || '',
   WEB_AGENT_MODEL_ID: process.env.WEB_AGENT_MODEL_ID || '',
+  WEB_AGENT_ROUTER_MODEL_ID: process.env.WEB_AGENT_ROUTER_MODEL_ID || '',
   WEB_AGENT_PORT: Number.parseInt(process.env.WEB_AGENT_PORT || '3001', 10),
   WEB_AGENT_BIND_HOST: process.env.WEB_AGENT_BIND_HOST || '127.0.0.1',
   WEB_AGENT_FETCH_CONCURRENCY: Number.parseInt(

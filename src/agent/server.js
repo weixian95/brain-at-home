@@ -143,6 +143,12 @@ async function handleAgent(req, res) {
       done: false,
     })
 
+    const sourceList = buildSourceList(sources)
+    emitEvent({
+      stage: 'sources',
+      sources: sourceList,
+      done: false,
+    })
     emitEvent({
       stage: 'analysis',
       content: `Synthesizing answer from ${sources.length} sources.`,
@@ -158,12 +164,12 @@ async function handleAgent(req, res) {
     })
 
     if (useStream) {
-      emitEvent({ stage: 'final_answer', content: answer, done: true })
+      emitEvent({ stage: 'final_answer', content: answer, sources: sourceList, done: true })
       res.end()
       return
     }
 
-    respondJson(res, 200, { answer })
+    respondJson(res, 200, { answer, sources: sourceList })
   } catch (error) {
     if (useStream) {
       emitEvent({
@@ -531,6 +537,15 @@ function buildSourcesBlock(sources) {
       return parts.join('\n')
     })
     .join('\n\n')
+}
+
+function buildSourceList(sources) {
+  return sources
+    .filter((source) => source && source.url)
+    .map((source) => ({
+      title: source.title || 'Untitled',
+      url: source.url,
+    }))
 }
 
 async function synthesizeAnswer({ prompt, messages, sources, modelId }) {
