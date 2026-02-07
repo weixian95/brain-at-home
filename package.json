@@ -4,10 +4,15 @@
   "private": true,
   "description": "Local Ollama gateway for tailnet access",
   "main": "server.js",
+  "dependencies": {
+    "dotenv": "^16.4.7"
+  },
   "scripts": {
     "start": "node server.js",
+    "start:agent": "node src/agent/server.js",
     "start:tailnet": "node server.js & sudo tailscale serve --bg --http=3000 localhost:3000 && sudo tailscale serve status",
-    "stop:tailnet": "sudo tailscale serve --http=3000 localhost:3000 off && sudo tailscale serve status; pkill -f \"node server.js\" || true"
+    "start:tailnet:agent": "npm run start:agent & npm run start:tailnet",
+    "stop:tailnet": "node scripts/stop-tailnet.js"
   },
   "engines": {
     "node": ">=18.0.0"
