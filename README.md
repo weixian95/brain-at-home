@@ -13,7 +13,7 @@ chat memory.
 2. On the host running BrainAtHome, enable serve:
    - `npm run start:tailnet`
 3. From another device on the same tailnet, call the API:
-   - `http://<your-host>.tailnet.ts.net:3000/api/chat`
+   - `https://<your-host>.tailnet.ts.net:3000/api/chat`
 
 ## Start server
 - `npm run start` (API)

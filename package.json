@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node server.js",
     "start:agent": "node src/agent/server.js",
-    "start:tailnet": "node server.js & sudo tailscale serve --bg --http=3000 localhost:3000 && sudo tailscale serve status",
+    "start:tailnet": "node server.js & sudo tailscale serve --bg --https=3000 localhost:3000 && sudo tailscale serve status",
     "start:tailnet:agent": "npm run start:agent & npm run start:tailnet",
     "stop:tailnet": "node scripts/stop-tailnet.js"
   },
