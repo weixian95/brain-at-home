@@ -4,10 +4,8 @@ const http = require('node:http')
 const { URL } = require('node:url')
 
 const { config } = require('../lib/config')
-const { callOllamaChat } = require('../lib/ollama')
 const { readJsonBody, respondJson, setCors, trimToCharBudget } = require('../lib/utils')
 
-const MAX_CONTEXT_MESSAGES = 6
 const MAX_QUERY_CHARS = 512
 
 const ENTITY_MAP = {
@@ -122,14 +120,12 @@ async function handleAgent(req, res) {
     })
 
     if (!results.length) {
-      const answer =
-        "I couldn't find relevant sources for that query. Try rephrasing or providing more detail."
       if (useStream) {
-        emitEvent({ stage: 'final_answer', content: answer, done: true })
+        emitEvent({ stage: 'sources', sources: [], done: false })
         res.end()
         return
       }
-      respondJson(res, 200, { answer })
+      respondJson(res, 200, { sources: [] })
       return
     }
 
@@ -144,32 +140,14 @@ async function handleAgent(req, res) {
     })
 
     const sourceList = buildSourceList(sources)
-    emitEvent({
-      stage: 'sources',
-      sources: sourceList,
-      done: false,
-    })
-    emitEvent({
-      stage: 'analysis',
-      content: `Synthesizing answer from ${sources.length} sources.`,
-      done: false,
-    })
-
-    const answer = await synthesizeAnswer({
-      prompt,
-      messages: payload.messages,
-      sources,
-      modelId:
-        payload.model_id || config.WEB_AGENT_MODEL_ID || config.DEFAULT_MODEL_ID,
-    })
 
     if (useStream) {
-      emitEvent({ stage: 'final_answer', content: answer, sources: sourceList, done: true })
+      emitEvent({ stage: 'sources', sources: sourceList, done: false })
       res.end()
       return
     }
 
-    respondJson(res, 200, { answer, sources: sourceList })
+    respondJson(res, 200, { sources: sourceList })
   } catch (error) {
     if (useStream) {
       emitEvent({
@@ -462,22 +440,6 @@ function isHttpUrl(value) {
   }
 }
 
-function buildContextBlock(messages) {
-  if (!Array.isArray(messages)) return ''
-  const trimmed = messages
-    .filter((message) => message && message.content && message.role !== 'system')
-    .slice(-MAX_CONTEXT_MESSAGES)
-
-  if (!trimmed.length) return ''
-  return trimmed
-    .map((message) => {
-      const role = message.role === 'assistant' ? 'Assistant' : 'User'
-      const content = trimToCharBudget(String(message.content), 800)
-      return `${role}: ${content}`
-    })
-    .join('\n')
-}
-
 function parseDomainList(value) {
   if (!value) return []
   return String(value)
@@ -518,66 +480,21 @@ async function mapWithConcurrency(items, limit, mapper) {
   return results
 }
 
-function buildSourcesBlock(sources) {
-  return sources
-    .map((source, index) => {
-      const parts = [
-        `[${index + 1}] ${source.title || 'Untitled'}`,
-        `URL: ${source.url}`,
-      ]
-
-      if (source.snippet) {
-        parts.push(`Snippet: ${source.snippet}`)
-      }
-
-      if (source.content) {
-        parts.push(`Content: ${source.content}`)
-      }
-
-      return parts.join('\n')
-    })
-    .join('\n\n')
-}
-
 function buildSourceList(sources) {
   return sources
     .filter((source) => source && source.url)
     .map((source) => ({
       title: source.title || 'Untitled',
       url: source.url,
+      summary: summarizeSource(source),
     }))
 }
 
-async function synthesizeAnswer({ prompt, messages, sources, modelId }) {
-  const systemPrompt = [
-    'You are a web research assistant.',
-    'Answer the user using only the provided sources.',
-    'Cite sources as plain URLs in parentheses at the end of sentences.',
-    'If sources conflict, say so and explain which you trust more and why.',
-    'If the sources are insufficient, say what is missing.',
-    'Do not mention tool calls or internal steps.',
-  ].join(' ')
-
-  const contextBlock = buildContextBlock(messages)
-  const sourcesBlock = buildSourcesBlock(sources)
-
-  const userPrompt = [
-    `Question: ${prompt}`,
-    contextBlock ? `Conversation context:\n${contextBlock}` : '',
-    'Sources:',
-    sourcesBlock || '(no sources)',
-    'Answer:',
-  ]
-    .filter(Boolean)
-    .join('\n\n')
-
-  return callOllamaChat({
-    baseUrl: config.OLLAMA_URL,
-    model: modelId,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ],
-    stream: false,
-  })
+function summarizeSource(source) {
+  if (!source) return ''
+  const snippet = String(source.snippet || '').trim()
+  if (snippet) return trimToCharBudget(snippet, 360)
+  const content = String(source.content || '').trim()
+  if (content) return trimToCharBudget(content, 360)
+  return ''
 }

@@ -81,6 +81,12 @@ const server = http.createServer(async (req, res) => {
     respondJson(res, 404, { error: 'Not found.' })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unexpected error.'
+    if (res.headersSent) {
+      if (!res.writableEnded) {
+        res.end()
+      }
+      return
+    }
     respondJson(res, 500, { error: message })
   }
 })
@@ -184,47 +190,22 @@ async function handleChat(req, res) {
 
     const localModelId = modelId || config.DEFAULT_MODEL_ID
 
-    const respondWithLocalFallback = async (reason, streamMode) => {
-      const answer = await callOllamaChat({
-        baseUrl: config.OLLAMA_URL,
-        model: localModelId,
-        messages: localPromptMessages,
-        stream: false,
-      })
-      const answerTs = Date.now()
-      const sources = []
-
-      await finalizeChatTurn({
-        record,
-        prompt,
-        messageId,
-        messageTs,
-        answer,
-        answerTs,
-      })
-
-      if (streamMode) {
-        if (!res.headersSent) {
-          startStreamResponse(res)
-        }
-        writeNdjson(res, { stage: 'fallback_local', reason, sources, done: false })
-        writeNdjson(res, { stage: 'final_answer', content: answer, sources, done: true })
-        if (!res.writableEnded) {
-          res.end()
-        }
-        return
-      }
-
-      respondJson(res, 200, { chat_id: chatId, answer, sources })
-    }
-
     const override = parseBooleanOverride(
       typeof useWeb !== 'undefined' ? useWeb : webSearch
     )
     if (override === null) {
-      respondJson(res, 400, {
-        error: 'Missing use_web. Client must choose local vs web agent.',
-      })
+      if (useStream) {
+        writeNdjson(res, {
+          stage: 'error',
+          error: 'Missing use_web. Client must choose local vs web agent.',
+          done: true,
+        })
+        res.end()
+      } else {
+        respondJson(res, 400, {
+          error: 'Missing use_web. Client must choose local vs web agent.',
+        })
+      }
       return
     }
 
@@ -249,15 +230,18 @@ async function handleChat(req, res) {
         recentTurns: config.RECENT_TURNS,
       })
 
+      let sources = []
       if (!config.WEB_AGENT_URL) {
-        await respondWithLocalFallback('WEB_AGENT_URL not configured', useStream)
-        return
-      }
-
-      if (useStream) {
+        if (useStream) {
+          writeNdjson(res, {
+            stage: 'web_agent_unavailable',
+            reason: 'WEB_AGENT_URL not configured',
+            done: false,
+          })
+        }
+      } else if (useStream) {
         try {
-          startStreamResponse(res)
-          const { answer, sources, sawSources, completed } = await streamWebAgent({
+          const result = await streamWebAgent({
             messages: agentMessages,
             prompt,
             userId,
@@ -267,54 +251,76 @@ async function handleChat(req, res) {
             modelId: localModelId,
             onEvent: (event) => {
               if (event && typeof event === 'object') {
-                writeNdjson(res, event)
+                const output = { ...event }
+                if (output.done === true) {
+                  output.done = false
+                }
+                writeNdjson(res, output)
               }
             },
           })
-
-          if (!completed || !answer) {
-            await respondWithLocalFallback('web agent failed', true)
-            return
-          }
-
-          if (!sawSources && Array.isArray(sources) && sources.length && !res.writableEnded) {
-            writeNdjson(res, { stage: 'sources', sources, done: false })
-          }
-
-          const answerTs = Date.now()
-          await finalizeChatTurn({
-            record,
-            prompt,
-            messageId,
-            messageTs,
-            answer,
-            answerTs,
-          })
-
-          if (!res.writableEnded) {
-            res.end()
+          sources = Array.isArray(result.sources) ? result.sources : []
+          if (!result.completed) {
+            writeNdjson(res, {
+              stage: 'web_agent_failed',
+              reason: 'web agent did not complete',
+              done: false,
+            })
           }
         } catch (error) {
-          await respondWithLocalFallback(
-            error instanceof Error ? error.message : 'web agent error',
-            true
-          )
+          writeNdjson(res, {
+            stage: 'web_agent_failed',
+            reason: error instanceof Error ? error.message : 'web agent error',
+            done: false,
+          })
         }
-        return
+      } else {
+        try {
+          const result = await callWebAgent({
+            messages: agentMessages,
+            prompt,
+            userId,
+            chatId,
+            messageId,
+            clientTs: messageTs,
+            modelId: localModelId,
+          })
+          sources = Array.isArray(result.sources) ? result.sources : []
+        } catch {
+          sources = []
+        }
       }
 
-      try {
-        const { answer, sources } = await callWebAgent({
-          messages: agentMessages,
-          prompt,
-          userId,
-          chatId,
-          messageId,
-          clientTs: messageTs,
-          modelId: localModelId,
-        })
-        const answerTs = Date.now()
+      const promptWithSources = injectSourcesIntoMessages(
+        localPromptMessages,
+        sources,
+        prompt
+      )
 
+      if (useStream) {
+        if (Array.isArray(sources) && sources.length && !res.writableEnded) {
+          writeNdjson(res, { stage: 'sources', sources, done: false })
+        }
+        writeNdjson(res, {
+          stage: 'analysis',
+          content: sources.length
+            ? `Using ${sources.length} web sources.`
+            : 'No web sources available; answering locally.',
+          done: false,
+        })
+
+        const { answer, completed } = await streamOllamaChat({
+          res,
+          baseUrl: config.OLLAMA_URL,
+          model: localModelId,
+          messages: promptWithSources,
+        })
+
+        if (!completed || !answer) {
+          return
+        }
+
+        const answerTs = Date.now()
         await finalizeChatTurn({
           record,
           prompt,
@@ -324,13 +330,30 @@ async function handleChat(req, res) {
           answerTs,
         })
 
-        respondJson(res, 200, { chat_id: chatId, answer, sources })
-      } catch (error) {
-        await respondWithLocalFallback(
-          error instanceof Error ? error.message : 'web agent error',
-          false
-        )
+        if (!res.writableEnded) {
+          res.end()
+        }
+        return
       }
+
+      const answer = await callOllamaChat({
+        baseUrl: config.OLLAMA_URL,
+        model: localModelId,
+        messages: promptWithSources,
+        stream: false,
+      })
+      const answerTs = Date.now()
+
+      await finalizeChatTurn({
+        record,
+        prompt,
+        messageId,
+        messageTs,
+        answer,
+        answerTs,
+      })
+
+      respondJson(res, 200, { chat_id: chatId, answer, sources })
       return
     }
 
@@ -423,6 +446,72 @@ function parseBooleanOverride(value) {
     if (['false', 'no', 'off'].includes(lowered)) return false
   }
   return null
+}
+
+function injectSourcesIntoMessages(messages, sources, userPrompt) {
+  if (!Array.isArray(messages) || messages.length === 0) return messages
+  if (!Array.isArray(sources) || sources.length === 0) return messages
+
+  const context = buildSourcesContext(sources)
+  if (!context) return messages
+  const explicitSearch = isExplicitSearchRequest(userPrompt)
+
+  const output = messages.slice(0, -1)
+  const last = messages[messages.length - 1]
+  const modeHint = explicitSearch
+    ? 'User explicitly requested web search results. Summarize the sources.'
+    : 'User did not explicitly ask for search results. Provide your own answer, using sources only to improve factual accuracy.'
+  output.push({
+    role: 'system',
+    content:
+      `${modeHint}\n\nWeb sources summary:\n${context}`,
+  })
+  if (last) output.push(last)
+  return output
+}
+
+function buildSourcesContext(sources) {
+  return sources
+    .filter((source) => source && source.url)
+    .map((source, index) => {
+      const title = source.title || 'Untitled'
+      const summary = source.summary ? `Summary: ${source.summary}` : ''
+      const parts = [
+        `[${index + 1}] ${title}`,
+        `URL: ${source.url}`,
+        summary,
+      ].filter(Boolean)
+      return parts.join('\n')
+    })
+    .join('\n\n')
+}
+
+function isExplicitSearchRequest(value) {
+  const text = String(value || '').toLowerCase()
+  if (!text.trim()) return false
+  const phrases = [
+    'search online',
+    'search the web',
+    'web search',
+    'find online',
+    'find the url',
+    'find url',
+    'get the url',
+    'share the url',
+    'source url',
+    'look it up',
+    'look up',
+    'browse the web',
+    'browse web',
+    'google',
+    'bing',
+    'brave search',
+    'list sources',
+    'show sources',
+    'give me sources',
+    'give sources',
+  ]
+  return phrases.some((phrase) => text.includes(phrase))
 }
 
 function getFirstUserPrompt(record, fallback) {

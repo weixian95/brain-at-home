@@ -29,22 +29,23 @@ npm run stop:tailnet
 ```
 
 ## Web Agent
-Uses Brave Search to gather sources and a local Ollama model to synthesize cited answers. If it fails, the
-API falls back to local inference.
+Uses Brave Search to gather sources. The API then asks the front-desk model (client-selected `model_id`) to
+formulate the final answer using the summarized sources.
 
 ### How it works:
 1. Client sets `use_web=true` to route to the web agent (or `false` for local).
 2. Agent searches Brave and fetches top pages.
 3. Agent extracts text (static HTML by default; optional dynamic via Playwright).
-4. Agent synthesizes a cited response.
+4. Agent returns summarized sources (title, url, short summary).
+5. API sends the summaries to the front-desk model to produce the final answer.
 
 ### Streaming:
 - With `stream: true`, NDJSON stage events are emitted.
 - Routing emits `routing` and `routing_decision` based on the client toggle.
 - Local inference emits `digest_prompt` and `analysis` before model tokens.
 - Web agent emits `digest_prompt`, `search_started`, `search_summary`, `fetch_started`, `fetch_complete`,
-  `sources`, `analysis`, `final_answer`, and `error`.
-- On failure, `fallback_local` then `final_answer`.
+  `sources`, and `error`.
+- The front-desk model then streams the final answer tokens.
 
 ## API
 - `GET /health`
@@ -75,7 +76,7 @@ Response includes `sources` when the web agent is used:
   "chat_id": "chat-001",
   "answer": "Answer with citations...",
   "sources": [
-    { "title": "Example", "url": "https://example.com" }
+    { "title": "Example", "url": "https://example.com", "summary": "Short summary..." }
   ]
 }
 ```

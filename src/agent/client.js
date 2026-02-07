@@ -28,6 +28,7 @@ function extractSources(payload) {
       .map((source) => ({
         title: source.title || 'Untitled',
         url: source.url,
+        summary: source.summary || '',
       }))
   }
   return []
@@ -73,13 +74,8 @@ async function callWebAgent({
     }
 
     const payload = await response.json()
-    const answer = extractAnswer(payload)
     const sources = extractSources(payload)
-    if (!answer) {
-      throw new Error('Web agent returned an empty response.')
-    }
-
-    return { answer, sources }
+    return { sources }
   } catch (error) {
     if (error && error.name === 'AbortError') {
       throw new Error('Web agent request timed out.')
@@ -163,11 +159,15 @@ async function streamWebAgent({
               .map((source) => ({
                 title: source.title || 'Untitled',
                 url: source.url,
+                summary: source.summary || '',
               }))
             sawSources = true
           }
           if (parsed && parsed.stage === 'sources') {
             sawSources = true
+            if (parsed.done === true) {
+              sawDone = true
+            }
           }
           if (parsed && parsed.done === true) {
             sawDone = true
@@ -194,11 +194,15 @@ async function streamWebAgent({
             .map((source) => ({
               title: source.title || 'Untitled',
               url: source.url,
+              summary: source.summary || '',
             }))
           sawSources = true
         }
         if (parsed && parsed.stage === 'sources') {
           sawSources = true
+          if (parsed.done === true) {
+            sawDone = true
+          }
         }
         if (parsed && parsed.done === true) {
           sawDone = true
@@ -215,7 +219,7 @@ async function streamWebAgent({
       answer,
       sources,
       sawSources,
-      completed: !aborted && (sawDone || answer.length > 0),
+      completed: !aborted && (sawDone || sawSources),
     }
   } catch (error) {
     if (error && error.name === 'AbortError') {
