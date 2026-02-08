@@ -25,6 +25,7 @@ const { callWebAgent, streamWebAgent } = require('../agent/client')
 
 const store = new FileStore(config.DATA_DIR, config.CHATS_DIR)
 const chatListeners = new Map()
+const SHARED_USER_ID = 'shared'
 const SEARCH_QUERY_SYSTEM_PROMPT =
   'You create search engine queries for Brave Search. ' +
   'Use the latest user prompt, and only use prior prompts if the latest lacks context. ' +
@@ -36,7 +37,7 @@ const SHORT_TASK_OPTIONS = { temperature: 0.2 }
 const QUERY_TIMEOUT_MS = 6000
 const INFO_SEEKING_TIMEOUT_MS = 6000
 const POLISH_TIMEOUT_MS = 20000
-const POLISH_MIN_CHARS = 1500
+const POLISH_MIN_CHARS = 600
 const TOPIC_TIMEOUT_MS = 0
 const POST_ANSWER_TASK_TIMEOUT_MS = 80000
 const TITLE_TIMEOUT_MS = 0
@@ -148,7 +149,6 @@ async function handleChat(req, res) {
     }
 
     const {
-      user_id: userId,
       chat_id: chatId,
       model_id: modelId,
       prompt,
@@ -159,8 +159,9 @@ async function handleChat(req, res) {
       web_search: webSearch,
     } = payload
 
+    const effectiveUserId = SHARED_USER_ID
+    const safeUserId = SHARED_USER_ID
     const missing = []
-    if (!isNonEmptyString(userId)) missing.push('user_id')
     if (!isNonEmptyString(chatId)) missing.push('chat_id')
     if (!isNonEmptyString(prompt)) missing.push('prompt')
     if (!isNonEmptyString(messageId)) missing.push('message_id')
@@ -213,9 +214,9 @@ async function handleChat(req, res) {
         : 'non_info_prompt'
       : 'client_override_off'
     const webDecision = { use: shouldUseWeb, reasons: [webReason] }
-    const chatKey = `${userId}:${chatId}`
+    const chatKey = `${effectiveUserId}:${chatId}`
     await withChatLock(chatKey, async () => {
-      const record = store.getOrCreateChat(userId, chatId)
+      const record = store.getOrCreateChat(effectiveUserId, chatId)
 
     if (record.idempotency && record.idempotency[messageId]) {
       const cached = record.idempotency[messageId]
@@ -339,7 +340,7 @@ async function handleChat(req, res) {
         try {
           const result = await streamWebAgent({
             query,
-            userId,
+            userId: safeUserId,
             chatId,
             messageId,
             clientTs: messageTs,
@@ -378,7 +379,7 @@ async function handleChat(req, res) {
         try {
           const result = await callWebAgent({
             query,
-            userId,
+            userId: safeUserId,
             chatId,
             messageId,
             clientTs: messageTs,
@@ -633,6 +634,11 @@ function parseBooleanOverride(value) {
     if (['false', 'no', 'off'].includes(lowered)) return false
   }
   return null
+}
+
+function saveChatRecord(record) {
+  if (!record) return
+  store.saveChat(record)
 }
 
 async function updateTopicAfterAnswer({ record, prompt, messageTs, modelId }) {
@@ -1461,7 +1467,7 @@ async function finalizeChatTurn({
     polished: false,
   }
 
-  store.saveChat(record)
+  saveChatRecord(record)
 
   if (deferHeavy) {
     return
@@ -1477,7 +1483,7 @@ async function finalizeChatTurn({
     sources,
     messageId,
   })
-  store.saveChat(record)
+  saveChatRecord(record)
 }
 
 async function runPostAnswerUpdates({
@@ -1515,9 +1521,9 @@ async function runPostAnswerUpdates({
     })
     if (!skipMemory) {
       await maybeUpdateMemory(record, answerTs, modelId, POST_ANSWER_TASK_TIMEOUT_MS)
-      store.saveChat(record)
+      saveChatRecord(record)
     }
-    store.saveChat(record)
+    saveChatRecord(record)
   } catch (error) {
     console.error('Post-answer updates failed:', error)
   }
@@ -1622,12 +1628,11 @@ async function maybePolishAnswer({
   }
 
   record.last_updated_ts = Date.now()
-  store.saveChat(record)
+  saveChatRecord(record)
 
   const chatKey = `${record.user_id}:${record.chat_id}`
   broadcastChatUpdate(chatKey, {
     type: 'answer',
-    user_id: record.user_id,
     chat_id: record.chat_id,
     content: { answer: cleaned, ts: record.last_updated_ts, polished: true },
   })
@@ -1672,7 +1677,7 @@ async function updateTopicAndTitle({ record, prompt, messageTs, modelId, emit })
   }
 
   if (record.title) {
-    store.saveChat(record)
+    saveChatRecord(record)
     if (emit) {
       emit({
         stage: 'title',
@@ -1683,7 +1688,6 @@ async function updateTopicAndTitle({ record, prompt, messageTs, modelId, emit })
     const chatKey = `${record.user_id}:${record.chat_id}`
     broadcastChatUpdate(chatKey, {
       type: 'title',
-      user_id: record.user_id,
       chat_id: record.chat_id,
       content: { title: record.title },
     })
@@ -1695,7 +1699,7 @@ async function updateTopicAndTitle({ record, prompt, messageTs, modelId, emit })
     messageTs,
     modelId: topicModelId,
   })
-  store.saveChat(record)
+  saveChatRecord(record)
   if (emit && record.topic) {
     emit({
       stage: 'topic',
@@ -1708,7 +1712,6 @@ async function updateTopicAndTitle({ record, prompt, messageTs, modelId, emit })
   if (record.topic) {
     broadcastChatUpdate(topicKey, {
       type: 'topic',
-      user_id: record.user_id,
       chat_id: record.chat_id,
       content: { topic: record.topic, ts: record.last_topic_ts || 0 },
     })
@@ -1905,26 +1908,25 @@ function isTooSimilarTitle(title, prompt) {
   return false
 }
 
-async function handleListChats(_req, res, url) {
-  const userId = url.searchParams.get('user_id')
-  if (!isNonEmptyString(userId)) {
-    respondJson(res, 400, { error: 'Missing user_id.' })
-    return
-  }
-
+async function handleListChats(_req, res) {
+  const userId = SHARED_USER_ID
   const chats = store.listChatsForUser(userId).map((chat) => ({
-    ...chat,
+    chat_id: chat.chat_id,
     title: chat.title || 'New chat',
+    topic: chat.topic || '',
+    summary: chat.summary || '',
+    facts: Array.isArray(chat.facts) ? chat.facts : [],
+    last_updated_ts: chat.last_updated_ts,
+    last_message_ts: chat.last_message_ts,
+    last_summary_ts: chat.last_summary_ts,
+    last_topic_ts: chat.last_topic_ts,
+    raw_count: chat.raw_count,
   }))
-  respondJson(res, 200, { user_id: userId, chats })
+  respondJson(res, 200, { chats })
 }
 
 async function handleChatRead(_req, res, url) {
-  const userId = url.searchParams.get('user_id')
-  if (!isNonEmptyString(userId)) {
-    respondJson(res, 400, { error: 'Missing user_id.' })
-    return
-  }
+  const userId = SHARED_USER_ID
 
   const path = url.pathname.replace(/^\/api\/chats\//, '')
   const parts = path.split('/').filter(Boolean)
@@ -1943,7 +1945,6 @@ async function handleChatRead(_req, res, url) {
 
   if (parts.length === 1) {
     respondJson(res, 200, {
-      user_id: record.user_id,
       chat_id: record.chat_id,
       title,
       topic: record.topic || '',
@@ -1971,7 +1972,6 @@ async function handleChatRead(_req, res, url) {
         : raw.slice(safeOffset)
 
     respondJson(res, 200, {
-      user_id: record.user_id,
       chat_id: record.chat_id,
       total: raw.length,
       offset: safeOffset,
@@ -1985,11 +1985,7 @@ async function handleChatRead(_req, res, url) {
 }
 
 async function handleChatStream(req, res, url) {
-  const userId = url.searchParams.get('user_id')
-  if (!isNonEmptyString(userId)) {
-    respondJson(res, 400, { error: 'Missing user_id.' })
-    return
-  }
+  const userId = SHARED_USER_ID
 
   const path = url.pathname.replace(/^\/api\/chats\//, '')
   const parts = path.split('/').filter(Boolean)
@@ -2004,7 +2000,7 @@ async function handleChatStream(req, res, url) {
   const record = store.getOrCreateChat(userId, chatId)
 
   startSseResponse(res)
-  writeSse(res, 'ready', { ok: true, user_id: userId, chat_id: chatId })
+  writeSse(res, 'ready', { ok: true, chat_id: chatId })
 
   const chatKey = `${userId}:${chatId}`
   const entry = addChatListener(chatKey, res)
@@ -2014,7 +2010,6 @@ async function handleChatStream(req, res, url) {
   if (currentTitle) {
     writeSse(res, 'chatinfoupdate', {
       type: 'title',
-      user_id: userId,
       chat_id: chatId,
       content: { title: currentTitle },
     })
@@ -2022,7 +2017,6 @@ async function handleChatStream(req, res, url) {
   if (currentTopic) {
     writeSse(res, 'chatinfoupdate', {
       type: 'topic',
-      user_id: userId,
       chat_id: chatId,
       content: { topic: currentTopic, ts: record.last_topic_ts || 0 },
     })
@@ -2034,11 +2028,7 @@ async function handleChatStream(req, res, url) {
 }
 
 async function handleChatDelete(_req, res, url) {
-  const userId = url.searchParams.get('user_id')
-  if (!isNonEmptyString(userId)) {
-    respondJson(res, 400, { error: 'Missing user_id.' })
-    return
-  }
+  const userId = SHARED_USER_ID
 
   const path = url.pathname.replace(/^\/api\/chats\//, '')
   const parts = path.split('/').filter(Boolean)
@@ -2055,5 +2045,5 @@ async function handleChatDelete(_req, res, url) {
     return
   }
 
-  respondJson(res, 200, { ok: true, user_id: userId, chat_id: chatId })
+  respondJson(res, 200, { ok: true, chat_id: chatId })
 }

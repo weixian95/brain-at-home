@@ -59,18 +59,18 @@ models handle low‑priority tasks.
    - Optional polish pass on long answers.
 
 ## API
+All clients connected to the server share the same chat history.
 - `GET /health`
-- `POST /api/chat` (required: `user_id`, `chat_id`, `prompt`, `message_id`; optional `model_id`, `stream`, `use_web`)
+- `POST /api/chat` (required: `chat_id`, `prompt`, `message_id`; optional `model_id`, `stream`, `use_web`)
 - `GET /api/tags` or `/api/models`
-- `GET /api/chats?user_id=...`
-- `GET /api/chats/:chat_id?user_id=...`
-- `GET /api/chats/:chat_id/messages?user_id=...&offset=0&limit=50`
-- `DELETE /api/chats/:chat_id?user_id=...`
+- `GET /api/chats`
+- `GET /api/chats/:chat_id`
+- `GET /api/chats/:chat_id/messages?offset=0&limit=50`
+- `DELETE /api/chats/:chat_id`
 
 Example request:
 ```json
 {
-  "user_id": "user-123",
   "chat_id": "chat-001",
   "model_id": "llama3",
   "prompt": "What did I ask you last time?",
