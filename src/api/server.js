@@ -35,6 +35,8 @@ const QUERY_CONTEXT_TURNS = 3
 const SHORT_TASK_OPTIONS = { temperature: 0.2 }
 const QUERY_TIMEOUT_MS = 6000
 const INFO_SEEKING_TIMEOUT_MS = 6000
+const POLISH_TIMEOUT_MS = 20000
+const POLISH_MIN_CHARS = 1500
 const TOPIC_TIMEOUT_MS = 0
 const POST_ANSWER_TASK_TIMEOUT_MS = 80000
 const TITLE_TIMEOUT_MS = 0
@@ -194,15 +196,20 @@ async function handleChat(req, res) {
     }
 
     const localModelId = modelId || config.DEFAULT_MODEL_ID
-    const infoSeeking = await determineInfoSeeking({
+    const explicitSearch = isExplicitSearchRequest(prompt)
+    const route = await determineInfoSeeking({
       prompt,
       modelId: localModelId,
     })
-
-    const shouldUseWeb = Boolean(override && infoSeeking)
+    const infoSeeking = route.infoSeeking
+    const shouldUseWeb = Boolean(
+      override && (explicitSearch || route.needsWeb || infoSeeking)
+    )
     const webReason = override
-      ? infoSeeking
-        ? 'client_override'
+      ? shouldUseWeb
+        ? explicitSearch
+          ? 'explicit_search'
+          : route.reason || 'classifier'
         : 'non_info_prompt'
       : 'client_override_off'
     const webDecision = { use: shouldUseWeb, reasons: [webReason] }
@@ -250,6 +257,7 @@ async function handleChat(req, res) {
         use_web: Boolean(webDecision && webDecision.use),
         source: 'client',
         reason: webReason,
+        confidence: route.confidence,
         done: false,
       })
       if (override && !infoSeeking) {
@@ -437,15 +445,20 @@ async function handleChat(req, res) {
         if (!res.writableEnded) {
           res.end()
         }
-        void runPostAnswerUpdates({
-          record,
-          answerTs,
-          messageTs,
-          prompt,
-          modelId: localModelId,
-        })
-        return
-      }
+      void runPostAnswerUpdates({
+        record,
+        answer,
+        answerTs,
+        messageTs,
+        prompt,
+        modelId: localModelId,
+        infoSeeking,
+        routeConfidence: route.confidence,
+        sources,
+        messageId,
+      })
+      return
+    }
 
       const answer = await runHighLlm(() =>
         callOllamaChat({
@@ -477,10 +490,15 @@ async function handleChat(req, res) {
       })
       await runPostAnswerUpdates({
         record,
+        answer,
         answerTs,
         messageTs,
         prompt,
         modelId: localModelId,
+        infoSeeking,
+        routeConfidence: route.confidence,
+        sources,
+        messageId,
       })
       return
     }
@@ -513,10 +531,15 @@ async function handleChat(req, res) {
       respondJson(res, 200, { chat_id: chatId, answer, topic: record.topic || '' })
       await runPostAnswerUpdates({
         record,
+        answer,
         answerTs,
         messageTs,
         prompt,
         modelId: localModelId,
+        infoSeeking,
+        routeConfidence: route.confidence,
+        sources: [],
+        messageId,
       })
       return
     }
@@ -567,10 +590,15 @@ async function handleChat(req, res) {
       }
       void runPostAnswerUpdates({
         record,
+        answer,
         answerTs,
         messageTs,
         prompt,
         modelId: localModelId,
+        infoSeeking,
+        routeConfidence: route.confidence,
+        sources: [],
+        messageId,
       })
     } catch (error) {
       if (!res.headersSent) {
@@ -1083,13 +1111,23 @@ function isInformationSeekingPromptHeuristic(value) {
 
 async function determineInfoSeeking({ prompt, modelId }) {
   const seed = trimToCharBudget(String(prompt || '').replace(/\s+/g, ' ').trim(), 400)
-  if (!seed) return false
+  const fallbackInfo = isInformationSeekingPromptHeuristic(prompt)
+  const fallback = {
+    infoSeeking: fallbackInfo,
+    needsWeb: fallbackInfo,
+    confidence: 0.5,
+    reason: 'heuristic',
+    source: 'heuristic',
+  }
+  if (!seed) return { ...fallback, infoSeeking: false, needsWeb: false }
   const classifierModelId = isNonEmptyString(config.INFO_SEEKING_MODEL_ID)
     ? config.INFO_SEEKING_MODEL_ID
     : modelId || config.DEFAULT_MODEL_ID
   const systemPrompt =
     'You are a routing classifier. Decide if the user prompt is information-seeking. ' +
-    'Return only JSON: {"info_seeking":true|false}. No extra keys.'
+    'Set needs_web=true if the question is time-sensitive, requires verification, or you are unsure. ' +
+    'Return only JSON with keys: info_seeking (boolean), needs_web (boolean), ' +
+    'confidence (0-1), reason (string).'
   const userPrompt = `Prompt: ${seed}`
   try {
     const response = await callOllamaChat({
@@ -1105,17 +1143,35 @@ async function determineInfoSeeking({ prompt, modelId }) {
       format: 'json',
     })
     const parsed = extractJson(response)
-    if (parsed && typeof parsed.info_seeking === 'boolean') {
-      return parsed.info_seeking
-    }
-    if (parsed && typeof parsed.needs_web === 'boolean') {
-      return parsed.needs_web
+    if (parsed && typeof parsed === 'object') {
+      const infoSeeking =
+        typeof parsed.info_seeking === 'boolean'
+          ? parsed.info_seeking
+          : typeof parsed.needs_web === 'boolean'
+            ? parsed.needs_web
+            : fallback.infoSeeking
+      const needsWeb =
+        typeof parsed.needs_web === 'boolean' ? parsed.needs_web : infoSeeking
+      const confidenceRaw =
+        typeof parsed.confidence === 'number' ? parsed.confidence : fallback.confidence
+      const confidence = Math.min(1, Math.max(0, confidenceRaw))
+      const reason =
+        typeof parsed.reason === 'string' && parsed.reason.trim()
+          ? parsed.reason.trim()
+          : 'classifier'
+      return {
+        infoSeeking,
+        needsWeb,
+        confidence,
+        reason,
+        source: 'llm',
+      }
     }
   } catch (error) {
     console.warn('Info-seeking classification failed:', error)
   }
 
-  return isInformationSeekingPromptHeuristic(prompt)
+  return fallback
 }
 
 function isConversationalPrompt(text) {
@@ -1391,6 +1447,7 @@ async function finalizeChatTurn({
     role: 'assistant',
     content: answer,
     ts: answerTs,
+    polished: false,
   })
 
   record.last_message_ts = messageTs
@@ -1401,6 +1458,7 @@ async function finalizeChatTurn({
     answer,
     ts: answerTs,
     sources: Array.isArray(sources) ? sources : [],
+    polished: false,
   }
 
   store.saveChat(record)
@@ -1411,20 +1469,28 @@ async function finalizeChatTurn({
 
   await runPostAnswerUpdates({
     record,
+    answer,
     answerTs,
     messageTs,
     prompt,
     modelId,
+    sources,
+    messageId,
   })
   store.saveChat(record)
 }
 
 async function runPostAnswerUpdates({
   record,
+  answer,
   answerTs,
   messageTs,
   prompt,
   modelId,
+  sources = [],
+  messageId,
+  infoSeeking = true,
+  routeConfidence = 1,
   emit,
   skipMemory = false,
 }) {
@@ -1437,6 +1503,16 @@ async function runPostAnswerUpdates({
       modelId,
       emit,
     })
+    await maybePolishAnswer({
+      record,
+      answer,
+      prompt,
+      modelId,
+      infoSeeking,
+      routeConfidence,
+      sources,
+      messageId,
+    })
     if (!skipMemory) {
       await maybeUpdateMemory(record, answerTs, modelId, POST_ANSWER_TASK_TIMEOUT_MS)
       store.saveChat(record)
@@ -1445,6 +1521,123 @@ async function runPostAnswerUpdates({
   } catch (error) {
     console.error('Post-answer updates failed:', error)
   }
+}
+
+async function maybePolishAnswer({
+  record,
+  answer,
+  prompt,
+  modelId,
+  infoSeeking,
+  routeConfidence,
+  sources,
+  messageId,
+}) {
+  if (!record || !answer) return false
+  const trimmedAnswer = String(answer || '').trim()
+  if (!trimmedAnswer) return false
+
+  const shouldPolish = trimmedAnswer.length >= POLISH_MIN_CHARS
+
+  if (!shouldPolish) {
+    console.log('[polish] skipped', {
+      chatId: record.chat_id,
+      infoSeeking,
+      sources: Array.isArray(sources) ? sources.length : 0,
+      answerChars: trimmedAnswer.length,
+      confidence: routeConfidence,
+      minChars: POLISH_MIN_CHARS,
+    })
+    return false
+  }
+  console.log('[polish] start', {
+    chatId: record.chat_id,
+    infoSeeking,
+    sources: Array.isArray(sources) ? sources.length : 0,
+    answerChars: trimmedAnswer.length,
+    confidence: routeConfidence,
+    minChars: POLISH_MIN_CHARS,
+  })
+
+  const polishModelId = isNonEmptyString(config.POLISH_MODEL_ID)
+    ? config.POLISH_MODEL_ID
+    : modelId || config.DEFAULT_MODEL_ID
+
+  const systemPrompt =
+    'You are a response polisher. Improve clarity and structure. ' +
+    'Do not add new facts. If unsure, say you are not sure. ' +
+    'Keep it concise and preserve any citations already present.'
+  const userPrompt = [
+    'User prompt:',
+    trimToCharBudget(String(prompt || '').replace(/\s+/g, ' ').trim(), 400),
+    '',
+    'Original answer:',
+    trimToCharBudget(trimmedAnswer, 1200),
+  ].join('\n')
+
+  let polished = ''
+  try {
+    polished = await runHighLlm(() =>
+      callOllamaChat({
+        baseUrl: config.OLLAMA_URL,
+        model: polishModelId,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        stream: false,
+        timeoutMs: POLISH_TIMEOUT_MS,
+        options: { temperature: 0.2 },
+      })
+    )
+  } catch (error) {
+    console.warn('Polish pass failed:', error)
+    return false
+  }
+
+  const cleaned = String(polished || '').trim()
+  if (!cleaned) {
+    console.warn('[polish] empty response')
+    return false
+  }
+  if (normalizeForCompare(cleaned) === normalizeForCompare(trimmedAnswer)) {
+    console.log('[polish] no change')
+    return false
+  }
+
+  if (Array.isArray(record.raw_messages)) {
+    for (let i = record.raw_messages.length - 1; i >= 0; i -= 1) {
+      const message = record.raw_messages[i]
+      if (message && message.role === 'assistant') {
+        message.content = cleaned
+        message.polished = true
+        break
+      }
+    }
+  }
+
+  if (messageId && record.idempotency && record.idempotency[messageId]) {
+    record.idempotency[messageId].answer = cleaned
+    record.idempotency[messageId].polished = true
+  }
+
+  record.last_updated_ts = Date.now()
+  store.saveChat(record)
+
+  const chatKey = `${record.user_id}:${record.chat_id}`
+  broadcastChatUpdate(chatKey, {
+    type: 'answer',
+    user_id: record.user_id,
+    chat_id: record.chat_id,
+    content: { answer: cleaned, ts: record.last_updated_ts, polished: true },
+  })
+
+  console.log('[polish] applied', {
+    chatId: record.chat_id,
+    answerChars: cleaned.length,
+  })
+
+  return true
 }
 
 async function updateTopicAndTitle({ record, prompt, messageTs, modelId, emit }) {

@@ -29,45 +29,34 @@ Health check: `curl http://127.0.0.1:3000/health`
 npm run stop:tailnet
 ```
 
-## How BrainAtHome thinks (flow)
-This section explains the decision flow and which models are used for internal tasks. The design goal is
-good responsiveness on a single 16GB VRAM GPU.
+## How It Works
+Brain At Home is optimized for a single 16GB VRAM GPU. The main answer stays on one model, while small
+models handle low‑priority tasks.
 
-### Performance goals
-- Keep the main response path on one model to avoid heavy model‑switch latency.
-- Allow model switching only for low‑priority tasks (title/topic/classifier), where small models are acceptable.
-- Keep memory updates and metadata generation off the critical path.
+### Model roles
+- **Main answer:** `model_id` (client-selected)
+- **Info‑seeking classifier:** `INFO_SEEKING_MODEL_ID` (small model)
+- **Title / topic:** `TITLE_MODEL_ID`, `TOPIC_MODEL_ID` (small model)
+- **Brave query generation:** `model_id`
+- **Memory updates:** `model_id`
 
-### Model roles (and why)
-- **Main response:** `model_id` (client-selected). Highest quality, minimal switching.
-- **Info‑seeking classifier:** `INFO_SEEKING_MODEL_ID` (defaults to `model_id` if unset). A small model keeps routing fast without delaying the answer.
-- **Title & topic:** `TITLE_MODEL_ID` / `TOPIC_MODEL_ID` (defaults to `model_id`). Title is generated once per chat; topic updates as the conversation evolves.
-- **Brave query generation:** uses `model_id` by default so the query reflects the same intent and context as the answer.
-- **Memory updates:** uses `model_id` by default so summaries stay consistent with the assistant’s tone and knowledge.
-
-### Non‑web mode (`use_web=false`)
-1. Build the prompt from:
-   - stored memory summary/facts
-   - latest 3 user prompts (latest is primary)
-2. Send to the client-selected model (`model_id`).
-3. Stream the answer back to the client.
-4. After the answer, run background tasks:
-   - generate/update title
-   - generate/update topic
-   - update memory summary/facts (if thresholds are met)
-
-### Web mode (`use_web=true`)
-1. Classify if the prompt is information‑seeking (LLM classifier).
-   - If classified as non‑info, the flow falls back to local (web‑off) response.
-2. Build a Brave-friendly query using:
-   - latest prompt (always)
-   - prior 2 prompts only if the latest lacks context
-3. Web agent fetches up to 5 Brave results.
-4. The front-desk model (`model_id`) answers using:
-   - memory summary/facts
-   - latest 3 prompts
-   - web sources
-5. Run the same background tasks as non-web mode.
+### Step‑by‑step flow (every request)
+1. **Receive prompt** with `use_web`, `model_id`, and message metadata.
+2. **Classify info‑seeking** (LLM classifier).
+3. **Decide web usage**
+   - If `use_web=false`: always local.
+   - If `use_web=true` and prompt is non‑info: fall back to local.
+   - If `use_web=true` and info‑seeking: use web agent.
+4. **Build the main prompt**
+   - Memory summary/facts + latest 3 user prompts.
+5. **Answer**
+   - **Local path:** main model answers immediately.
+   - **Web path:** generate Brave query → fetch up to 5 sources → main model answers with sources.
+6. **Respond to client**
+   - Stream tokens (if `stream=true`) or return JSON.
+7. **Background tasks**
+   - Title (once per chat), topic (every chat), memory update (if threshold).
+   - Optional polish pass on long answers.
 
 ## API
 - `GET /health`

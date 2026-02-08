@@ -9,6 +9,7 @@ const config = {
     'You are a helpful assistant. Use the provided memory to stay consistent and accurate.',
   DEFAULT_MODEL_ID: process.env.DEFAULT_MODEL_ID || 'llama3',
   INFO_SEEKING_MODEL_ID: process.env.INFO_SEEKING_MODEL_ID || '',
+  POLISH_MODEL_ID: process.env.POLISH_MODEL_ID || '',
   TITLE_MODEL_ID: process.env.TITLE_MODEL_ID || '',
   TOPIC_MODEL_ID: process.env.TOPIC_MODEL_ID || '',
   TOPIC_MAX_WORDS: Number.parseInt(process.env.TOPIC_MAX_WORDS || '6', 10),
