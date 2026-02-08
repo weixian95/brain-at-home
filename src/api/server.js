@@ -5,6 +5,7 @@ const { FileStore } = require('../lib/storage')
 const { withChatLock } = require('../lib/locks')
 const {
   buildPromptMessages,
+  selectRecentUserMessages,
   shouldUpdateMemory,
   updateMemory,
 } = require('../lib/memory')
@@ -14,13 +15,32 @@ const {
   respondJson,
   setCors,
   trimToCharBudget,
+  extractJson,
 } = require('../lib/utils')
 const { callOllamaChat, listOllamaModels } = require('../lib/ollama')
+const { runHighLlm } = require('../lib/llm_queue')
+const { generateTopic } = require('../lib/topic')
 // Web agent routing is controlled by client input (use_web/web_search).
 const { callWebAgent, streamWebAgent } = require('../agent/client')
-const { getWebAgentSystemPrompt } = require('../agent/prompt')
 
 const store = new FileStore(config.DATA_DIR, config.CHATS_DIR)
+const chatListeners = new Map()
+const SEARCH_QUERY_SYSTEM_PROMPT =
+  'You create search engine queries for Brave Search. ' +
+  'Use the latest user prompt, and only use prior prompts if the latest lacks context. ' +
+  'Return only the query text (no quotes, no punctuation, no extra words). ' +
+  'Keep it within 10 words.'
+const QUERY_MAX_WORDS = 10
+const QUERY_CONTEXT_TURNS = 3
+const SHORT_TASK_OPTIONS = { temperature: 0.2 }
+const QUERY_TIMEOUT_MS = 6000
+const INFO_SEEKING_TIMEOUT_MS = 6000
+const TOPIC_TIMEOUT_MS = 0
+const POST_ANSWER_TASK_TIMEOUT_MS = 80000
+const TITLE_TIMEOUT_MS = 0
+const TITLE_LLM_OPTIONS = { temperature: 0.2, repeat_penalty: 1.2 }
+const TITLE_LLM_RETRY_OPTIONS = { temperature: 0.7, repeat_penalty: 1.2 }
+const TITLE_MAX_WORDS = 6
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -63,6 +83,15 @@ const server = http.createServer(async (req, res) => {
       return
     }
 
+    if (
+      url.pathname.startsWith('/api/chats/') &&
+      url.pathname.endsWith('/stream') &&
+      req.method === 'GET'
+    ) {
+      await handleChatStream(req, res, url)
+      return
+    }
+
     if (url.pathname.startsWith('/api/chats/') && req.method === 'GET') {
       await handleChatRead(req, res, url)
       return
@@ -102,99 +131,54 @@ server.listen(config.PORT, config.BIND_HOST, () => {
 })
 
 async function handleChat(req, res) {
-  let payload
   try {
-    payload = await readJsonBody(req, config.MAX_BODY_BYTES)
-  } catch (error) {
-    respondJson(res, 400, { error: 'Invalid JSON body.' })
-    return
-  }
-
-  if (!payload || typeof payload !== 'object') {
-    respondJson(res, 400, { error: 'Missing request body.' })
-    return
-  }
-
-  const {
-    user_id: userId,
-    chat_id: chatId,
-    model_id: modelId,
-    prompt,
-    message_id: messageId,
-    client_ts: clientTs,
-    stream,
-    use_web: useWeb,
-    web_search: webSearch,
-  } = payload
-
-  const missing = []
-  if (!isNonEmptyString(userId)) missing.push('user_id')
-  if (!isNonEmptyString(chatId)) missing.push('chat_id')
-  if (!isNonEmptyString(prompt)) missing.push('prompt')
-  if (!isNonEmptyString(messageId)) missing.push('message_id')
-  if (!isNonEmptyString(modelId) && !config.DEFAULT_MODEL_ID) missing.push('model_id')
-
-  if (missing.length) {
-    respondJson(res, 400, { error: `Missing fields: ${missing.join(', ')}` })
-    return
-  }
-
-  const useStream = isStreamRequested(stream)
-  const chatKey = `${userId}:${chatId}`
-  await withChatLock(chatKey, async () => {
-    const record = store.getOrCreateChat(userId, chatId)
-
-    if (record.idempotency && record.idempotency[messageId]) {
-      const cachedAnswer = record.idempotency[messageId].answer
-      if (useStream) {
-        startStreamResponse(res)
-        writeNdjson(res, {
-          message: { role: 'assistant', content: cachedAnswer },
-          done: true,
-        })
-        res.end()
-        return
-      }
-
-      respondJson(res, 200, { chat_id: chatId, answer: cachedAnswer })
+    let payload
+    try {
+      payload = await readJsonBody(req, config.MAX_BODY_BYTES)
+    } catch (error) {
+      respondJson(res, 400, { error: 'Invalid JSON body.' })
       return
     }
 
-    const requestTs = Date.now()
-    const messageTs = Number.isFinite(clientTs) ? clientTs : requestTs
-
-    if (useStream) {
-      startStreamResponse(res)
-      writeNdjson(res, {
-        stage: 'routing',
-        content: 'Selecting information acquisition strategy.',
-        done: false,
-      })
+    if (!payload || typeof payload !== 'object') {
+      respondJson(res, 400, { error: 'Missing request body.' })
+      return
     }
 
-    const budgets = {
-      summary: config.SUMMARY_TOKEN_BUDGET,
-      facts: config.FACTS_TOKEN_BUDGET,
-      recent: config.RECENT_TOKEN_BUDGET,
+    const {
+      user_id: userId,
+      chat_id: chatId,
+      model_id: modelId,
+      prompt,
+      message_id: messageId,
+      client_ts: clientTs,
+      stream,
+      use_web: useWeb,
+      web_search: webSearch,
+    } = payload
+
+    const missing = []
+    if (!isNonEmptyString(userId)) missing.push('user_id')
+    if (!isNonEmptyString(chatId)) missing.push('chat_id')
+    if (!isNonEmptyString(prompt)) missing.push('prompt')
+    if (!isNonEmptyString(messageId)) missing.push('message_id')
+    if (!isNonEmptyString(modelId) && !config.DEFAULT_MODEL_ID) {
+      missing.push('model_id')
     }
 
-    const localPromptMessages = buildPromptMessages({
-      systemPrompt: config.SYSTEM_PROMPT,
-      summary: record.summary,
-      facts: record.facts,
-      rawMessages: record.raw_messages,
-      newPrompt: prompt,
-      budgets,
-      recentTurns: config.RECENT_TURNS,
-    })
+    if (missing.length) {
+      respondJson(res, 400, { error: `Missing fields: ${missing.join(', ')}` })
+      return
+    }
 
-    const localModelId = modelId || config.DEFAULT_MODEL_ID
-
+    const useStream = isStreamRequested(stream)
     const override = parseBooleanOverride(
       typeof useWeb !== 'undefined' ? useWeb : webSearch
     )
+
     if (override === null) {
       if (useStream) {
+        startStreamResponse(res)
         writeNdjson(res, {
           stage: 'error',
           error: 'Missing use_web. Client must choose local vs web agent.',
@@ -209,28 +193,132 @@ async function handleChat(req, res) {
       return
     }
 
-    const webDecision = { use: override, reasons: ['client_override'] }
+    const localModelId = modelId || config.DEFAULT_MODEL_ID
+    const infoSeeking = await determineInfoSeeking({
+      prompt,
+      modelId: localModelId,
+    })
+
+    const shouldUseWeb = Boolean(override && infoSeeking)
+    const webReason = override
+      ? infoSeeking
+        ? 'client_override'
+        : 'non_info_prompt'
+      : 'client_override_off'
+    const webDecision = { use: shouldUseWeb, reasons: [webReason] }
+    const chatKey = `${userId}:${chatId}`
+    await withChatLock(chatKey, async () => {
+      const record = store.getOrCreateChat(userId, chatId)
+
+    if (record.idempotency && record.idempotency[messageId]) {
+      const cached = record.idempotency[messageId]
+      const cachedAnswer = cached.answer
+      const cachedSources = Array.isArray(cached.sources) ? cached.sources : []
+      if (useStream) {
+        startStreamResponse(res)
+        if (cachedSources.length) {
+          writeNdjson(res, { stage: 'sources', sources: cachedSources, done: false })
+        }
+        writeNdjson(res, {
+          message: { role: 'assistant', content: cachedAnswer },
+          done: true,
+        })
+        res.end()
+        return
+      }
+
+      respondJson(res, 200, {
+        chat_id: chatId,
+        answer: cachedAnswer,
+        sources: cachedSources,
+        topic: record.topic || '',
+      })
+      return
+    }
+
+    const requestTs = Date.now()
+    const messageTs = Number.isFinite(clientTs) ? clientTs : requestTs
     if (useStream) {
+      startStreamResponse(res)
+      writeNdjson(res, {
+        stage: 'routing',
+        content: 'Selecting information acquisition strategy.',
+        done: false,
+      })
       writeNdjson(res, {
         stage: 'routing_decision',
         use_web: Boolean(webDecision && webDecision.use),
         source: 'client',
-        reason: 'client_override',
+        reason: webReason,
         done: false,
       })
+      if (override && !infoSeeking) {
+        writeNdjson(res, {
+          stage: 'analysis',
+          content: 'Web search skipped for non-information prompt.',
+          done: false,
+        })
+      }
     }
+
+    const budgets = {
+      summary: config.SUMMARY_TOKEN_BUDGET,
+      facts: config.FACTS_TOKEN_BUDGET,
+      recent: config.RECENT_TOKEN_BUDGET,
+    }
+
+    const basePromptMessages = buildPromptMessages({
+      systemPrompt: config.SYSTEM_PROMPT,
+      summary: record.summary,
+      facts: record.facts,
+      rawMessages: record.raw_messages,
+      newPrompt: prompt,
+      budgets,
+      recentTurns: config.RECENT_TURNS,
+    })
+    const topic = typeof record.topic === 'string' ? record.topic : ''
+    const localPromptMessages = injectNonInfoHint(
+      injectTopicIntoMessages(basePromptMessages, topic),
+      infoSeeking
+    )
     if (webDecision.use) {
-      const agentMessages = buildPromptMessages({
-        systemPrompt: getWebAgentSystemPrompt(config.WEB_AGENT_SYSTEM_PROMPT),
-        summary: record.summary,
-        facts: record.facts,
-        rawMessages: record.raw_messages,
-        newPrompt: prompt,
-        budgets,
-        recentTurns: config.RECENT_TURNS,
-      })
+      if (useStream) {
+        writeNdjson(res, {
+          stage: 'analysis',
+          content: 'Generating search query.',
+          done: false,
+        })
+      }
+
+      let query = ''
+      let queryTimedOut = false
+      try {
+        query = await runHighLlm(() =>
+          generateSearchQuery({
+            baseUrl: config.OLLAMA_URL,
+            modelId: localModelId,
+            rawMessages: record.raw_messages,
+            prompt,
+          })
+        )
+      } catch (error) {
+        queryTimedOut = error instanceof Error && error.message.includes('timed out')
+        query = ''
+      }
+
+      if (!query) {
+        query = fallbackSearchQuery(prompt)
+        if (useStream && queryTimedOut) {
+          writeNdjson(res, {
+            stage: 'analysis',
+            content: 'Query generation timed out; using prompt as search query.',
+            done: false,
+          })
+        }
+      }
 
       let sources = []
+      let sourcesSent = false
       if (!config.WEB_AGENT_URL) {
         if (useStream) {
           writeNdjson(res, {
@@ -242,8 +330,7 @@ async function handleChat(req, res) {
       } else if (useStream) {
         try {
           const result = await streamWebAgent({
-            messages: agentMessages,
-            prompt,
+            query,
             userId,
             chatId,
             messageId,
@@ -260,12 +347,17 @@ async function handleChat(req, res) {
             },
           })
           sources = Array.isArray(result.sources) ? result.sources : []
+          const sawSources = Boolean(result.sawSources)
           if (!result.completed) {
             writeNdjson(res, {
               stage: 'web_agent_failed',
               reason: 'web agent did not complete',
               done: false,
             })
+          }
+          if (!sawSources && sources.length && !res.writableEnded) {
+            writeNdjson(res, { stage: 'sources', sources, done: false })
+            sourcesSent = true
           }
         } catch (error) {
           writeNdjson(res, {
@@ -277,8 +369,7 @@ async function handleChat(req, res) {
       } else {
         try {
           const result = await callWebAgent({
-            messages: agentMessages,
-            prompt,
+            query,
             userId,
             chatId,
             messageId,
@@ -294,12 +385,19 @@ async function handleChat(req, res) {
       const promptWithSources = injectSourcesIntoMessages(
         localPromptMessages,
         sources,
-        prompt
+        prompt,
+        infoSeeking
       )
 
       if (useStream) {
-        if (Array.isArray(sources) && sources.length && !res.writableEnded) {
+        if (
+          Array.isArray(sources) &&
+          sources.length &&
+          !sourcesSent &&
+          !res.writableEnded
+        ) {
           writeNdjson(res, { stage: 'sources', sources, done: false })
+          sourcesSent = true
         }
         writeNdjson(res, {
           stage: 'analysis',
@@ -309,12 +407,15 @@ async function handleChat(req, res) {
           done: false,
         })
 
-        const { answer, completed } = await streamOllamaChat({
-          res,
-          baseUrl: config.OLLAMA_URL,
-          model: localModelId,
-          messages: promptWithSources,
-        })
+        const { answer, completed } = await runHighLlm(() =>
+          streamOllamaChat({
+            res,
+            baseUrl: config.OLLAMA_URL,
+            model: localModelId,
+            messages: promptWithSources,
+            end: false,
+          })
+        )
 
         if (!completed || !answer) {
           return
@@ -328,20 +429,32 @@ async function handleChat(req, res) {
           messageTs,
           answer,
           answerTs,
+          modelId: localModelId,
+          sources,
+          deferHeavy: true,
         })
 
         if (!res.writableEnded) {
           res.end()
         }
+        void runPostAnswerUpdates({
+          record,
+          answerTs,
+          messageTs,
+          prompt,
+          modelId: localModelId,
+        })
         return
       }
 
-      const answer = await callOllamaChat({
-        baseUrl: config.OLLAMA_URL,
-        model: localModelId,
-        messages: promptWithSources,
-        stream: false,
-      })
+      const answer = await runHighLlm(() =>
+        callOllamaChat({
+          baseUrl: config.OLLAMA_URL,
+          model: localModelId,
+          messages: promptWithSources,
+          stream: false,
+        })
+      )
       const answerTs = Date.now()
 
       await finalizeChatTurn({
@@ -351,21 +464,38 @@ async function handleChat(req, res) {
         messageTs,
         answer,
         answerTs,
+        modelId: localModelId,
+        sources,
+        deferHeavy: true,
       })
 
-      respondJson(res, 200, { chat_id: chatId, answer, sources })
+      respondJson(res, 200, {
+        chat_id: chatId,
+        answer,
+        sources,
+        topic: record.topic || '',
+      })
+      await runPostAnswerUpdates({
+        record,
+        answerTs,
+        messageTs,
+        prompt,
+        modelId: localModelId,
+      })
       return
     }
 
     const promptMessages = localPromptMessages
 
     if (!useStream) {
-      const answer = await callOllamaChat({
-        baseUrl: config.OLLAMA_URL,
-        model: modelId || config.DEFAULT_MODEL_ID,
-        messages: promptMessages,
-        stream: false,
-      })
+      const answer = await runHighLlm(() =>
+        callOllamaChat({
+          baseUrl: config.OLLAMA_URL,
+          model: modelId || config.DEFAULT_MODEL_ID,
+          messages: promptMessages,
+          stream: false,
+        })
+      )
       const answerTs = Date.now()
 
       await finalizeChatTurn({
@@ -375,9 +505,19 @@ async function handleChat(req, res) {
         messageTs,
         answer,
         answerTs,
+        modelId: localModelId,
+        sources: [],
+        deferHeavy: true,
       })
 
-      respondJson(res, 200, { chat_id: chatId, answer })
+      respondJson(res, 200, { chat_id: chatId, answer, topic: record.topic || '' })
+      await runPostAnswerUpdates({
+        record,
+        answerTs,
+        messageTs,
+        prompt,
+        modelId: localModelId,
+      })
       return
     }
 
@@ -396,12 +536,15 @@ async function handleChat(req, res) {
         done: false,
       })
 
-      const { answer, completed } = await streamOllamaChat({
-        res,
-        baseUrl: config.OLLAMA_URL,
-        model: modelId || config.DEFAULT_MODEL_ID,
-        messages: promptMessages,
-      })
+      const { answer, completed } = await runHighLlm(() =>
+        streamOllamaChat({
+          res,
+          baseUrl: config.OLLAMA_URL,
+          model: modelId || config.DEFAULT_MODEL_ID,
+          messages: promptMessages,
+          end: false,
+        })
+      )
 
       if (!completed || !answer) {
         return
@@ -415,6 +558,19 @@ async function handleChat(req, res) {
         messageTs,
         answer,
         answerTs,
+        modelId: localModelId,
+        sources: [],
+        deferHeavy: true,
+      })
+      if (!res.writableEnded) {
+        res.end()
+      }
+      void runPostAnswerUpdates({
+        record,
+        answerTs,
+        messageTs,
+        prompt,
+        modelId: localModelId,
       })
     } catch (error) {
       if (!res.headersSent) {
@@ -424,7 +580,10 @@ async function handleChat(req, res) {
         res.end()
       }
     }
-  })
+    })
+  } finally {
+    // no-op
+  }
 }
 
 function isNonEmptyString(value) {
@@ -448,23 +607,337 @@ function parseBooleanOverride(value) {
   return null
 }
 
-function injectSourcesIntoMessages(messages, sources, userPrompt) {
+async function updateTopicAfterAnswer({ record, prompt, messageTs, modelId }) {
+  if (!record) return ''
+  const currentTopic = typeof record.topic === 'string' ? record.topic : ''
+  const recentMessages = collectRecentTopicMessages(record, prompt, 4)
+
+  let nextTopic = currentTopic
+  let timedOut = false
+  try {
+    console.log('[topic] request', {
+      modelId,
+      timeoutMs: TOPIC_TIMEOUT_MS,
+      maxWords: config.TOPIC_MAX_WORDS,
+      currentTopic,
+      promptPreview: summarizePrompt(prompt, 120),
+    })
+    const topicResult = await runHighLlm(() =>
+      generateTopic({
+        baseUrl: config.OLLAMA_URL,
+        modelId,
+        currentTopic,
+        recentPrompts: recentMessages,
+        maxWords: config.TOPIC_MAX_WORDS,
+        timeoutMs: TOPIC_TIMEOUT_MS,
+      })
+    )
+    const candidate =
+      topicResult && typeof topicResult.topic === 'string' ? topicResult.topic : ''
+    if (candidate) {
+      const same =
+        currentTopic &&
+        candidate.trim().toLowerCase() === currentTopic.trim().toLowerCase()
+      if (!same) {
+        nextTopic = candidate
+      }
+    }
+  } catch (error) {
+    timedOut =
+      error instanceof Error && typeof error.message === 'string'
+        ? error.message.includes('timed out')
+        : false
+    if (!timedOut) {
+      console.error('Topic generation failed:', error)
+    }
+  }
+
+  if (!nextTopic) {
+    nextTopic = fallbackTopicFromPrompt(prompt, currentTopic, config.TOPIC_MAX_WORDS)
+  }
+
+  record.topic = nextTopic || currentTopic || ''
+  record.last_topic_ts = messageTs
+
+  if (timedOut) {
+    console.warn('[topic] generation timed out; fallback used')
+  }
+
+  return record.topic
+}
+
+function collectRecentTopicMessages(record, fallbackPrompt, limit) {
+  const maxItems = Number.isFinite(limit) ? Math.max(1, limit) : 4
+  const raw = Array.isArray(record?.raw_messages) ? record.raw_messages : []
+  const recent = raw
+    .filter((message) => message && typeof message.content === 'string')
+    .slice(-maxItems)
+    .map((message) => {
+      const role = message.role === 'assistant' ? 'assistant' : 'user'
+      const content = trimWords(
+        String(message.content || '').replace(/\s+/g, ' ').trim(),
+        20
+      )
+      return content ? `${role}: ${content}` : ''
+    })
+    .filter(Boolean)
+  if (recent.length) return recent
+  const fallback = String(fallbackPrompt || '').replace(/\s+/g, ' ').trim()
+  return fallback ? [fallback] : []
+}
+
+function trimWords(value, maxWords) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim()
+  if (!text) return ''
+  const words = text.split(' ').filter(Boolean)
+  if (!Number.isFinite(maxWords) || maxWords <= 0) return text
+  return words.slice(0, maxWords).join(' ')
+}
+
+function fallbackTopicFromPrompt(prompt, currentTopic, maxWords) {
+  const cleaned = normalizePromptSeed(prompt)
+  if (!cleaned) return currentTopic || ''
+  if (isConversationalPrompt(cleaned)) {
+    return currentTopic || ''
+  }
+  const words = cleaned.split(' ').filter(Boolean)
+  if (words.length <= 2 && currentTopic) {
+    return currentTopic
+  }
+  const limited = words.slice(0, Math.max(1, maxWords || 6)).join(' ')
+  return limited
+}
+
+function fallbackTitleFromPrompt(prompt) {
+  const cleaned = normalizeTitleSeed(prompt)
+  if (!cleaned) return ''
+  const words = cleaned.split(' ').filter(Boolean)
+  const limited = words.slice(0, 8).join(' ')
+  return trimToCharBudget(limited, config.TITLE_MAX_CHARS)
+}
+
+function normalizeTitleSeed(prompt) {
+  const cleaned = String(prompt || '')
+    .replace(/[^\w\s'-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!cleaned) return ''
+  const stripped = stripPromptLeadCase(cleaned)
+  return stripped || cleaned
+}
+
+function normalizePromptSeed(prompt) {
+  const cleaned = String(prompt || '')
+    .toLowerCase()
+    .replace(/[^\w\s'-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!cleaned) return ''
+  const stripped = stripPromptLead(cleaned)
+  return stripped || cleaned
+}
+
+function stripPromptLead(text) {
+  let cleaned = String(text || '').trim()
+  const patterns = [
+    /^please\s+/,
+    /^(do you know( about)?|do you remember|do you have info on)\s+/,
+    /^(tell me about|tell me|explain)\s+/,
+    /^(what is|who is|where is|when is|why is|how is|how to|how do i|how do you)\s+/,
+    /^(can you|could you|would you|will you)\s+/,
+    /^(find( me)?|search( for)?|look up)\s+/,
+    /^(give me|list|show me)\s+/,
+  ]
+  for (const pattern of patterns) {
+    if (pattern.test(cleaned)) {
+      cleaned = cleaned.replace(pattern, '').trim()
+    }
+  }
+  return cleaned
+}
+
+function stripPromptLeadCase(text) {
+  let cleaned = String(text || '').trim()
+  const patterns = [
+    /^please\s+/i,
+    /^(do you know( about)?|do you remember|do you have info on)\s+/i,
+    /^(tell me about|tell me|explain)\s+/i,
+    /^(what is|who is|where is|when is|why is|how is|how to|how do i|how do you)\s+/i,
+    /^(can you|could you|would you|will you)\s+/i,
+    /^(find( me)?|search( for)?|look up)\s+/i,
+    /^(give me|list|show me)\s+/i,
+  ]
+  for (const pattern of patterns) {
+    if (pattern.test(cleaned)) {
+      cleaned = cleaned.replace(pattern, '').trim()
+    }
+  }
+  return cleaned
+}
+
+async function generateSearchQuery({
+  baseUrl,
+  modelId,
+  rawMessages,
+  prompt,
+}) {
+  const recentPrompts = collectQueryPrompts(rawMessages, prompt, QUERY_CONTEXT_TURNS)
+  const latestPrompt = recentPrompts[recentPrompts.length - 1] || String(prompt || '')
+  const priorPrompts = recentPrompts.slice(0, -1)
+
+  const userPrompt = [
+    'Latest user prompt (always use):',
+    `1) ${latestPrompt || '(empty)'}`,
+    '',
+    'Previous prompts (use only if needed for context):',
+    priorPrompts.length
+      ? priorPrompts.map((text, index) => `${index + 2}) ${text}`).join('\n')
+      : '(none)',
+    '',
+    'Return only the search query.',
+  ].join('\n')
+
+  const response = await callOllamaChat({
+    baseUrl,
+    model: modelId,
+    messages: [
+      { role: 'system', content: SEARCH_QUERY_SYSTEM_PROMPT },
+      { role: 'user', content: userPrompt },
+    ],
+    stream: false,
+    timeoutMs: QUERY_TIMEOUT_MS,
+    options: SHORT_TASK_OPTIONS,
+  })
+
+  return normalizeSearchQuery(response)
+}
+
+function normalizeSearchQuery(value) {
+  const text = String(value || '').trim()
+  if (!text) return ''
+  const firstLine = text.split('\n')[0].trim()
+  const cleaned = firstLine
+    .replace(/^["'“”]+|["'“”]+$/g, '')
+    .replace(/[.?!]+$/, '')
+    .trim()
+  return trimQueryWords(cleaned, QUERY_MAX_WORDS)
+}
+
+function collectQueryPrompts(rawMessages, latestPrompt, maxPrompts) {
+  const desired = Math.max(1, maxPrompts || 1)
+  const previousCount = Math.max(0, desired - 1)
+  const previous = selectRecentUserMessages(
+    rawMessages,
+    previousCount,
+    config.RECENT_TOKEN_BUDGET
+  ).map((message) => String(message.content))
+  const combined = [...previous, String(latestPrompt || '')].filter(Boolean)
+  return combined.slice(-desired)
+}
+
+function trimQueryWords(value, maxWords) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim()
+  if (!text) return ''
+  const words = text.split(' ').filter(Boolean)
+  if (words.length <= maxWords) return text
+  return words.slice(0, Math.max(1, maxWords)).join(' ')
+}
+
+function limitWords(value, maxWords) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim()
+  if (!text) return ''
+  const words = text.split(' ').filter(Boolean)
+  if (!Number.isFinite(maxWords) || maxWords <= 0) return text
+  return words.slice(0, maxWords).join(' ')
+}
+
+function stripTrailingThink(value, seed) {
+  const text = String(value || '').trim()
+  if (!text) return ''
+  const words = text.split(/\s+/).filter(Boolean)
+  if (words.length === 0) return ''
+  const last = words[words.length - 1].toLowerCase()
+  if (last !== 'think' && last !== 'thinking') return text
+  const promptNorm = normalizeForCompare(seed)
+  if (promptNorm.includes(last)) return text
+  words.pop()
+  return words.join(' ').trim()
+}
+
+function fallbackSearchQuery(prompt) {
+  const cleaned = String(prompt || '').replace(/\s+/g, ' ').trim()
+  return trimQueryWords(trimToCharBudget(cleaned, 200), QUERY_MAX_WORDS)
+}
+
+function injectTopicIntoMessages(messages, topic) {
+  if (!topic || !Array.isArray(messages) || messages.length === 0) return messages
+  const output = messages.slice()
+  const topicLine = { role: 'system', content: `Current chat topic: ${topic}` }
+  let insertAt = 1
+  if (output.length > 1 && output[1].role === 'system') {
+    insertAt = 2
+  }
+  output.splice(insertAt, 0, topicLine)
+  return output
+}
+
+function injectNonInfoHint(messages, infoSeeking) {
+  if (infoSeeking || !Array.isArray(messages) || messages.length === 0) {
+    return messages
+  }
+  const output = messages.slice(0, -1)
+  const last = messages[messages.length - 1]
+  output.push({
+    role: 'system',
+    content:
+      'The user prompt is conversational/emotional and not information-seeking. ' +
+      'Respond naturally and empathetically. Do not provide list-style or search-style answers. ' +
+      'Do not mention web search unless asked.',
+  })
+  if (last) output.push(last)
+  return output
+}
+
+function injectSourcesIntoMessages(messages, sources, userPrompt, infoSeekingOverride) {
   if (!Array.isArray(messages) || messages.length === 0) return messages
   if (!Array.isArray(sources) || sources.length === 0) return messages
 
   const context = buildSourcesContext(sources)
   if (!context) return messages
   const explicitSearch = isExplicitSearchRequest(userPrompt)
+  const infoSeeking =
+    typeof infoSeekingOverride === 'boolean'
+      ? infoSeekingOverride
+      : isInformationSeekingPromptHeuristic(userPrompt)
+
+  if (!explicitSearch && !infoSeeking) {
+    const output = messages.slice(0, -1)
+    const last = messages[messages.length - 1]
+    output.push({
+      role: 'system',
+      content:
+        'The user prompt is not information-seeking. Respond naturally and empathetically. ' +
+        'Do not mention web sources unless the user asked for them.',
+    })
+    if (last) output.push(last)
+    return output
+  }
 
   const output = messages.slice(0, -1)
   const last = messages[messages.length - 1]
   const modeHint = explicitSearch
-    ? 'User explicitly requested web search results. Summarize the sources.'
-    : 'User did not explicitly ask for search results. Provide your own answer, using sources only to improve factual accuracy.'
+    ? 'User explicitly requested web search results. Provide a concise summary of the sources.'
+    : 'User did not explicitly ask for search results. Provide your own answer and use sources only to improve factual accuracy.'
+  const relevanceHint =
+    'If the sources do not help answer a factual question, say you do not know.'
+  const emotionalHint =
+    'If the user prompt is emotional or not information-seeking, respond empathetically and you may ignore the sources.'
+  const citationHint =
+    'When you use sources, cite them with plain URLs in parentheses.'
   output.push({
     role: 'system',
     content:
-      `${modeHint}\n\nWeb sources summary:\n${context}`,
+      `${modeHint}\n${relevanceHint}\n${emotionalHint}\n${citationHint}\n\nWeb sources summary:\n${context}`,
   })
   if (last) output.push(last)
   return output
@@ -491,9 +964,14 @@ function isExplicitSearchRequest(value) {
   if (!text.trim()) return false
   const phrases = [
     'search online',
+    'search online about',
     'search the web',
     'web search',
+    'search about',
+    'search for',
+    'help me search',
     'find online',
+    'find the url of',
     'find the url',
     'find url',
     'get the url',
@@ -512,6 +990,214 @@ function isExplicitSearchRequest(value) {
     'give sources',
   ]
   return phrases.some((phrase) => text.includes(phrase))
+}
+
+function isInformationSeekingPromptHeuristic(value) {
+  const text = String(value || '').toLowerCase().trim()
+  if (!text) return false
+  if (isConversationalPrompt(text)) return false
+  const explicit = isExplicitSearchRequest(text)
+  const hasQuestion = text.includes('?')
+  const triggers = [
+    'what',
+    'why',
+    'how',
+    'when',
+    'where',
+    'who',
+    'which',
+    'explain',
+    'define',
+    'definition',
+    'meaning',
+    'guide',
+    'steps',
+    'tutorial',
+    'help me',
+    'show me',
+    'tell me',
+    'find',
+    'search',
+    'lookup',
+    'look up',
+    'compare',
+    'recommend',
+    'best',
+    'top',
+    'list',
+    'latest',
+    'current',
+    'price',
+    'cost',
+    'schedule',
+    'release',
+    'deadline',
+    'policy',
+    'law',
+    'regulation',
+    'version',
+    'api',
+    'docs',
+    'weather',
+    'forecast',
+    'temperature',
+    'rain',
+    'snow',
+    'wind',
+    'air quality',
+  ]
+  const hasTrigger = triggers.some((phrase) => text.includes(phrase))
+  if (explicit || hasQuestion || hasTrigger) return true
+
+  const emotionalPhrases = [
+    'i like',
+    'i love',
+    'i hate',
+    'i dislike',
+    'i feel',
+    "i'm",
+    'im ',
+    'i am',
+    'i enjoy',
+    'i prefer',
+    'my favorite',
+    'i dont like',
+    "i don't like",
+    'i am sad',
+    'i am happy',
+    'i am upset',
+    'i am worried',
+    'i am excited',
+    'i feel sad',
+    'i feel happy',
+    'i feel upset',
+    'i feel worried',
+  ]
+  if (emotionalPhrases.some((phrase) => text.includes(phrase))) return false
+  if (text.startsWith('i ') || text.startsWith("i'm") || text.startsWith('im ')) {
+    return false
+  }
+
+  return false
+}
+
+async function determineInfoSeeking({ prompt, modelId }) {
+  const seed = trimToCharBudget(String(prompt || '').replace(/\s+/g, ' ').trim(), 400)
+  if (!seed) return false
+  const classifierModelId = isNonEmptyString(config.INFO_SEEKING_MODEL_ID)
+    ? config.INFO_SEEKING_MODEL_ID
+    : modelId || config.DEFAULT_MODEL_ID
+  const systemPrompt =
+    'You are a routing classifier. Decide if the user prompt is information-seeking. ' +
+    'Return only JSON: {"info_seeking":true|false}. No extra keys.'
+  const userPrompt = `Prompt: ${seed}`
+  try {
+    const response = await callOllamaChat({
+      baseUrl: config.OLLAMA_URL,
+      model: classifierModelId,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      stream: false,
+      timeoutMs: INFO_SEEKING_TIMEOUT_MS,
+      options: { temperature: 0, top_p: 0.1 },
+      format: 'json',
+    })
+    const parsed = extractJson(response)
+    if (parsed && typeof parsed.info_seeking === 'boolean') {
+      return parsed.info_seeking
+    }
+    if (parsed && typeof parsed.needs_web === 'boolean') {
+      return parsed.needs_web
+    }
+  } catch (error) {
+    console.warn('Info-seeking classification failed:', error)
+  }
+
+  return isInformationSeekingPromptHeuristic(prompt)
+}
+
+function isConversationalPrompt(text) {
+  const normalized = String(text || '')
+    .toLowerCase()
+    .replace(/[^\w\s?']/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!normalized) return false
+  const phrases = [
+    'how about you',
+    'what about you',
+    'and you',
+    'how are you',
+    'who are you',
+    'what are you',
+    'what can you do',
+    'what do you do',
+    'tell me more',
+    'tell me more about you',
+    'tell me about yourself',
+    'introduce yourself',
+    'who made you',
+    'who built you',
+    'who created you',
+    'who trained you',
+    'are you real',
+    'are you human',
+    'your name',
+    'are you there',
+    'you there',
+    'can you hear me',
+    'can you see me',
+    'are you listening',
+    'thanks',
+    'thank you',
+    'thx',
+    'ty',
+    'hi',
+    'hello',
+    'hey',
+    'sup',
+    'yo',
+    'good morning',
+    'good evening',
+    'good night',
+    'good afternoon',
+    'nice to meet you',
+    'bye',
+    'goodbye',
+    'see you',
+    'see ya',
+    'later',
+    'gn',
+  ]
+  if (
+    phrases.some(
+      (phrase) =>
+        normalized === phrase ||
+        normalized.startsWith(`${phrase} `) ||
+        normalized.endsWith(` ${phrase}`) ||
+        normalized.includes(` ${phrase} `)
+    )
+  ) {
+    return true
+  }
+  const shortReplies = [
+    'ok',
+    'okay',
+    'sure',
+    'cool',
+    'great',
+    'nice',
+    'fine',
+    'alright',
+    'thanks',
+    'thank you',
+    'np',
+    'k',
+  ]
+  if (normalized.length <= 12 && shortReplies.includes(normalized)) return true
+  return false
 }
 
 function getFirstUserPrompt(record, fallback) {
@@ -540,7 +1226,60 @@ function writeNdjson(res, payload) {
   res.write(`${JSON.stringify(payload)}\n`)
 }
 
-async function streamOllamaChat({ res, baseUrl, model, messages }) {
+function startSseResponse(res) {
+  if (res.headersSent) return
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+  })
+}
+
+function writeSse(res, event, payload) {
+  if (res.writableEnded) return
+  res.write(`event: ${event}\n`)
+  res.write(`data: ${JSON.stringify(payload)}\n\n`)
+}
+
+function addChatListener(chatKey, res) {
+  const entry = { res, heartbeat: null }
+  let listeners = chatListeners.get(chatKey)
+  if (!listeners) {
+    listeners = new Set()
+    chatListeners.set(chatKey, listeners)
+  }
+  listeners.add(entry)
+  entry.heartbeat = setInterval(() => {
+    if (res.writableEnded) return
+    res.write(': ping\n\n')
+  }, 15000)
+  return entry
+}
+
+function removeChatListener(chatKey, entry) {
+  if (!entry) return
+  if (entry.heartbeat) {
+    clearInterval(entry.heartbeat)
+  }
+  const listeners = chatListeners.get(chatKey)
+  if (!listeners) return
+  listeners.delete(entry)
+  if (listeners.size === 0) {
+    chatListeners.delete(chatKey)
+  }
+}
+
+function broadcastChatUpdate(chatKey, payload) {
+  const listeners = chatListeners.get(chatKey)
+  if (!listeners || listeners.size === 0) return
+  for (const entry of listeners) {
+    if (entry && entry.res && !entry.res.writableEnded) {
+      writeSse(entry.res, 'chatinfoupdate', payload)
+    }
+  }
+}
+
+async function streamOllamaChat({ res, baseUrl, model, messages, end = true }) {
   const endpoint = new URL('/api/chat', baseUrl)
   const controller = new AbortController()
   let aborted = false
@@ -619,7 +1358,7 @@ async function streamOllamaChat({ res, baseUrl, model, messages }) {
     }
   }
 
-  if (!res.writableEnded) {
+  if (end && !res.writableEnded) {
     res.end()
   }
 
@@ -638,6 +1377,9 @@ async function finalizeChatTurn({
   messageTs,
   answer,
   answerTs,
+  modelId,
+  sources = [],
+  deferHeavy = false,
 }) {
   record.raw_messages.push({
     role: 'user',
@@ -651,31 +1393,136 @@ async function finalizeChatTurn({
     ts: answerTs,
   })
 
-  record.last_message_ts = answerTs
-  record.last_updated_ts = answerTs
+  record.last_message_ts = messageTs
+  record.last_updated_ts = messageTs
 
   record.idempotency = record.idempotency || {}
-  record.idempotency[messageId] = { answer, ts: answerTs }
+  record.idempotency[messageId] = {
+    answer,
+    ts: answerTs,
+    sources: Array.isArray(sources) ? sources : [],
+  }
 
+  store.saveChat(record)
+
+  if (deferHeavy) {
+    return
+  }
+
+  await runPostAnswerUpdates({
+    record,
+    answerTs,
+    messageTs,
+    prompt,
+    modelId,
+  })
+  store.saveChat(record)
+}
+
+async function runPostAnswerUpdates({
+  record,
+  answerTs,
+  messageTs,
+  prompt,
+  modelId,
+  emit,
+  skipMemory = false,
+}) {
+  if (!record) return
+  try {
+    await updateTopicAndTitle({
+      record,
+      prompt,
+      messageTs: messageTs || answerTs,
+      modelId,
+      emit,
+    })
+    if (!skipMemory) {
+      await maybeUpdateMemory(record, answerTs, modelId, POST_ANSWER_TASK_TIMEOUT_MS)
+      store.saveChat(record)
+    }
+    store.saveChat(record)
+  } catch (error) {
+    console.error('Post-answer updates failed:', error)
+  }
+}
+
+async function updateTopicAndTitle({ record, prompt, messageTs, modelId, emit }) {
+  if (!record) return
+  const safeModelId = modelId || config.DEFAULT_MODEL_ID
+  const titleModelId = isNonEmptyString(config.TITLE_MODEL_ID)
+    ? config.TITLE_MODEL_ID
+    : safeModelId
+  const topicModelId = isNonEmptyString(config.TOPIC_MODEL_ID)
+    ? config.TOPIC_MODEL_ID
+    : safeModelId
   if (!record.title) {
     const firstPrompt = getFirstUserPrompt(record, prompt)
     if (firstPrompt) {
+      let generated = ''
       try {
-        const generated = await generateTitle(firstPrompt)
-        if (generated) {
-          record.title = generated
-        }
+        generated = await runHighLlm(() =>
+          generateTitle(firstPrompt, titleModelId, TITLE_TIMEOUT_MS)
+        )
       } catch (error) {
         console.error('Title generation failed:', error)
+      }
+      if (!generated) {
+        const fallback = fallbackTitleFromPrompt(firstPrompt)
+        if (fallback) {
+          record.title = fallback
+        }
+      } else {
+        record.title = generated
       }
     }
   }
 
-  await maybeUpdateMemory(record, answerTs)
+  if (record.title) {
+    store.saveChat(record)
+    if (emit) {
+      emit({
+        stage: 'title',
+        title: record.title,
+        done: false,
+      })
+    }
+    const chatKey = `${record.user_id}:${record.chat_id}`
+    broadcastChatUpdate(chatKey, {
+      type: 'title',
+      user_id: record.user_id,
+      chat_id: record.chat_id,
+      content: { title: record.title },
+    })
+  }
+
+  await updateTopicAfterAnswer({
+    record,
+    prompt,
+    messageTs,
+    modelId: topicModelId,
+  })
   store.saveChat(record)
+  if (emit && record.topic) {
+    emit({
+      stage: 'topic',
+      topic: record.topic,
+      ts: record.last_topic_ts,
+      done: false,
+    })
+  }
+  const topicKey = `${record.user_id}:${record.chat_id}`
+  if (record.topic) {
+    broadcastChatUpdate(topicKey, {
+      type: 'topic',
+      user_id: record.user_id,
+      chat_id: record.chat_id,
+      content: { topic: record.topic, ts: record.last_topic_ts || 0 },
+    })
+  }
 }
 
-async function maybeUpdateMemory(record, now) {
+async function maybeUpdateMemory(record, now, modelId, timeoutMs) {
   const summaryAnchor = getLastSummaryTs(record)
   const messagesSince = record.raw_messages.filter(
     (message) => message.ts > summaryAnchor
@@ -693,16 +1540,19 @@ async function maybeUpdateMemory(record, now) {
     })
   ) {
     try {
-      const updated = await updateMemory({
-        baseUrl: config.OLLAMA_URL,
-        memoryModelId: config.MEMORY_MODEL_ID,
-        previousSummary: record.summary,
-        previousFacts: record.facts,
-        messagesSince,
-        summaryBudget: config.SUMMARY_TOKEN_BUDGET,
-        factsBudget: config.FACTS_TOKEN_BUDGET,
-        inputTokenBudget: config.MEMORY_UPDATE_INPUT_TOKENS,
-      })
+      const updated = await runHighLlm(() =>
+        updateMemory({
+          baseUrl: config.OLLAMA_URL,
+          memoryModelId: modelId || config.DEFAULT_MODEL_ID,
+          previousSummary: record.summary,
+          previousFacts: record.facts,
+          messagesSince,
+          summaryBudget: config.SUMMARY_TOKEN_BUDGET,
+          factsBudget: config.FACTS_TOKEN_BUDGET,
+          inputTokenBudget: config.MEMORY_UPDATE_INPUT_TOKENS,
+          timeoutMs,
+        })
+      )
 
       if (updated) {
         record.summary = updated.summary
@@ -748,36 +1598,118 @@ function getLastSummaryTs(record) {
   return 0
 }
 
-async function generateTitle(prompt) {
+async function generateTitle(prompt, modelId, timeoutMs) {
+  console.log('[title] request', {
+    modelId: modelId || config.DEFAULT_MODEL_ID,
+    timeoutMs,
+    promptPreview: summarizePrompt(prompt, 120),
+  })
   const systemPrompt =
-    'You generate concise chat titles. ' +
-    'Return only the title text, no quotes, no markdown, no extra commentary.'
-  const userPrompt = [
-    'Create a short, specific title (max 8 words).',
-    'Avoid punctuation at the end.',
-    'Use the user intent, not the exact sentence.',
-    '',
-    `First user message: ${prompt}`,
-  ].join('\n')
+    'Return a JSON object with a "title" string only. ' +
+    'Do not copy the prompt verbatim. ' +
+    'No analysis. No extra keys.'
+  const seed = summarizePrompt(prompt, 240)
+  const userPrompt = buildTitlePrompt(seed, false)
+
+  const titleModelId = modelId || config.DEFAULT_MODEL_ID
 
   const response = await callOllamaChat({
     baseUrl: config.OLLAMA_URL,
-    model: config.TITLE_MODEL_ID || config.MEMORY_MODEL_ID,
+    model: titleModelId,
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
     ],
     stream: false,
+    timeoutMs,
+    options: TITLE_LLM_OPTIONS,
+    format: 'json',
   })
 
-  const cleaned = String(response || '')
-    .split('\n')[0]
-    .replace(/^["'“”]+|["'“”]+$/g, '')
-    .replace(/[.?!]+$/, '')
-    .trim()
+  const parsed = extractJson(response)
+  const rawTitle =
+    parsed && typeof parsed.title === 'string'
+      ? parsed.title
+      : String(response || '').split('\n')[0]
+  const cleaned = stripTrailingThink(
+    limitWords(
+      String(rawTitle || '')
+        .replace(/^["'“”]+|["'“”]+$/g, '')
+        .replace(/[.?!]+$/, '')
+        .trim(),
+      TITLE_MAX_WORDS
+    ),
+    seed
+  )
 
-  if (!cleaned) return ''
+  if (!cleaned || isTooSimilarTitle(cleaned, seed)) {
+    console.warn('[title] empty or similar response, retrying with relaxed options')
+    const retry = await callOllamaChat({
+      baseUrl: config.OLLAMA_URL,
+      model: titleModelId,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: buildTitlePrompt(seed, true) },
+      ],
+      stream: false,
+      timeoutMs,
+      options: TITLE_LLM_RETRY_OPTIONS,
+      format: 'json',
+    })
+    const retryParsed = extractJson(retry)
+    const retryRaw =
+      retryParsed && typeof retryParsed.title === 'string'
+        ? retryParsed.title
+        : String(retry || '').split('\n')[0]
+    const retryCleaned = stripTrailingThink(
+      limitWords(
+        String(retryRaw || '')
+          .replace(/^["'“”]+|["'“”]+$/g, '')
+          .replace(/[.?!]+$/, '')
+          .trim(),
+        TITLE_MAX_WORDS
+      ),
+      seed
+    )
+    if (!retryCleaned) return fallbackTitleFromPrompt(prompt)
+    return trimToCharBudget(retryCleaned, config.TITLE_MAX_CHARS)
+  }
   return trimToCharBudget(cleaned, config.TITLE_MAX_CHARS)
+}
+
+function summarizePrompt(value, maxChars) {
+  const cleaned = String(value || '').replace(/\s+/g, ' ').trim()
+  return trimToCharBudget(cleaned, maxChars || 120)
+}
+
+function buildTitlePrompt(seed, strict) {
+  const extra = strict
+    ? 'Use different wording than the prompt.'
+    : 'Paraphrase briefly.'
+  return [
+    `Title (max ${TITLE_MAX_WORDS} words). Return JSON: {"title":"..."}.`,
+    extra,
+    `Latest prompt: ${seed}`,
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+function normalizeForCompare(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^\w\s'-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function isTooSimilarTitle(title, prompt) {
+  const a = normalizeForCompare(title)
+  const b = normalizeForCompare(prompt)
+  if (!a || !b) return false
+  if (a === b) return true
+  if (b.includes(a) && a.length >= 8) return true
+  return false
 }
 
 async function handleListChats(_req, res, url) {
@@ -810,11 +1742,7 @@ async function handleChatRead(_req, res, url) {
     return
   }
 
-  const record = store.loadChat(userId, chatId)
-  if (!record) {
-    respondJson(res, 404, { error: 'Chat not found.' })
-    return
-  }
+  const record = store.getOrCreateChat(userId, chatId)
 
   const title = record.title || 'New chat'
 
@@ -825,11 +1753,13 @@ async function handleChatRead(_req, res, url) {
       user_id: record.user_id,
       chat_id: record.chat_id,
       title,
+      topic: record.topic || '',
       summary: record.summary || '',
       facts: Array.isArray(record.facts) ? record.facts : [],
       last_updated_ts: getLastUpdatedTs(record),
       last_message_ts: lastMessageTs,
       last_summary_ts: getLastSummaryTs(record),
+      last_topic_ts: Number.isFinite(record.last_topic_ts) ? record.last_topic_ts : 0,
       raw_count: Array.isArray(record.raw_messages)
         ? record.raw_messages.length
         : 0,
@@ -859,6 +1789,55 @@ async function handleChatRead(_req, res, url) {
   }
 
   respondJson(res, 404, { error: 'Not found.' })
+}
+
+async function handleChatStream(req, res, url) {
+  const userId = url.searchParams.get('user_id')
+  if (!isNonEmptyString(userId)) {
+    respondJson(res, 400, { error: 'Missing user_id.' })
+    return
+  }
+
+  const path = url.pathname.replace(/^\/api\/chats\//, '')
+  const parts = path.split('/').filter(Boolean)
+  const chatId = decodeURIComponent(parts[0] || '')
+  const action = parts[1]
+
+  if (!isNonEmptyString(chatId) || action !== 'stream') {
+    respondJson(res, 404, { error: 'Not found.' })
+    return
+  }
+
+  const record = store.getOrCreateChat(userId, chatId)
+
+  startSseResponse(res)
+  writeSse(res, 'ready', { ok: true, user_id: userId, chat_id: chatId })
+
+  const chatKey = `${userId}:${chatId}`
+  const entry = addChatListener(chatKey, res)
+
+  const currentTitle = record.title || ''
+  const currentTopic = record.topic || ''
+  if (currentTitle) {
+    writeSse(res, 'chatinfoupdate', {
+      type: 'title',
+      user_id: userId,
+      chat_id: chatId,
+      content: { title: currentTitle },
+    })
+  }
+  if (currentTopic) {
+    writeSse(res, 'chatinfoupdate', {
+      type: 'topic',
+      user_id: userId,
+      chat_id: chatId,
+      content: { topic: currentTopic, ts: record.last_topic_ts || 0 },
+    })
+  }
+
+  const cleanup = () => removeChatListener(chatKey, entry)
+  req.on('close', cleanup)
+  res.on('close', cleanup)
 }
 
 async function handleChatDelete(_req, res, url) {

@@ -35,8 +35,7 @@ function extractSources(payload) {
 }
 
 async function callWebAgent({
-  messages,
-  prompt,
+  query,
   userId,
   chatId,
   messageId,
@@ -56,8 +55,7 @@ async function callWebAgent({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        messages,
-        prompt,
+        query,
         user_id: userId,
         chat_id: chatId,
         message_id: messageId,
@@ -87,8 +85,7 @@ async function callWebAgent({
 }
 
 async function streamWebAgent({
-  messages,
-  prompt,
+  query,
   userId,
   chatId,
   messageId,
@@ -110,8 +107,7 @@ async function streamWebAgent({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        messages,
-        prompt,
+        query,
         user_id: userId,
         chat_id: chatId,
         message_id: messageId,

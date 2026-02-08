@@ -46,11 +46,13 @@ class FileStore {
       user_id: userId,
       chat_id: chatId,
       title: '',
+      topic: '',
       summary: '',
       facts: [],
       last_updated_ts: 0,
       last_message_ts: 0,
       last_summary_ts: 0,
+      last_topic_ts: 0,
       raw_messages: [],
       idempotency: {},
     }
@@ -76,12 +78,16 @@ class FileStore {
           user_id: record.user_id,
           chat_id: record.chat_id,
           title: record.title || '',
+          topic: record.topic || '',
           summary: record.summary || '',
           facts: Array.isArray(record.facts) ? record.facts : [],
           last_updated_ts: lastUpdatedTs,
           last_message_ts: lastMessageTs,
           last_summary_ts: Number.isFinite(record.last_summary_ts)
             ? record.last_summary_ts
+            : 0,
+          last_topic_ts: Number.isFinite(record.last_topic_ts)
+            ? record.last_topic_ts
             : 0,
           raw_count: Array.isArray(record.raw_messages)
             ? record.raw_messages.length

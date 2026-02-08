@@ -1,12 +1,13 @@
 # Brain At Home
 Expose a self-hosted Ollama chat endpoint to clients on the same private Tailscale network, with lightweight
-chat memory.
+memory, optional web search, and streaming status updates.
 
 ## Features
-- Local Ollama API gateway with chat memory.
+- Local Ollama API gateway with chat memory + latest 3 user prompts.
 - Tailnet access via Tailscale.
-- Optional web agent (Brave Search + local Ollama) with fallback to local.
+- Optional web agent (Brave Search + local Ollama).
 - NDJSON streaming with stage events.
+- Title/topic generation for chat UI updates.
 
 ## Tailscale setup
 1. Install Tailscale and log in.
@@ -28,24 +29,45 @@ Health check: `curl http://127.0.0.1:3000/health`
 npm run stop:tailnet
 ```
 
-## Web Agent
-Uses Brave Search to gather sources. The API then asks the front-desk model (client-selected `model_id`) to
-formulate the final answer using the summarized sources.
+## How BrainAtHome thinks (flow)
+This section explains the decision flow and which models are used for internal tasks. The design goal is
+good responsiveness on a single 16GB VRAM GPU.
 
-### How it works:
-1. Client sets `use_web=true` to route to the web agent (or `false` for local).
-2. Agent searches Brave and fetches top pages.
-3. Agent extracts text (static HTML by default; optional dynamic via Playwright).
-4. Agent returns summarized sources (title, url, short summary).
-5. API sends the summaries to the front-desk model to produce the final answer.
+### Performance goals
+- Keep the main response path on one model to avoid heavy model‑switch latency.
+- Allow model switching only for low‑priority tasks (title/topic/classifier), where small models are acceptable.
+- Keep memory updates and metadata generation off the critical path.
 
-### Streaming:
-- With `stream: true`, NDJSON stage events are emitted.
-- Routing emits `routing` and `routing_decision` based on the client toggle.
-- Local inference emits `digest_prompt` and `analysis` before model tokens.
-- Web agent emits `digest_prompt`, `search_started`, `search_summary`, `fetch_started`, `fetch_complete`,
-  `sources`, and `error`.
-- The front-desk model then streams the final answer tokens.
+### Model roles (and why)
+- **Main response:** `model_id` (client-selected). Highest quality, minimal switching.
+- **Info‑seeking classifier:** `INFO_SEEKING_MODEL_ID` (defaults to `model_id` if unset). A small model keeps routing fast without delaying the answer.
+- **Title & topic:** `TITLE_MODEL_ID` / `TOPIC_MODEL_ID` (defaults to `model_id`). Title is generated once per chat; topic updates as the conversation evolves.
+- **Brave query generation:** uses `model_id` by default so the query reflects the same intent and context as the answer.
+- **Memory updates:** uses `model_id` by default so summaries stay consistent with the assistant’s tone and knowledge.
+
+### Non‑web mode (`use_web=false`)
+1. Build the prompt from:
+   - stored memory summary/facts
+   - latest 3 user prompts (latest is primary)
+2. Send to the client-selected model (`model_id`).
+3. Stream the answer back to the client.
+4. After the answer, run background tasks:
+   - generate/update title
+   - generate/update topic
+   - update memory summary/facts (if thresholds are met)
+
+### Web mode (`use_web=true`)
+1. Classify if the prompt is information‑seeking (LLM classifier).
+   - If classified as non‑info, the flow falls back to local (web‑off) response.
+2. Build a Brave-friendly query using:
+   - latest prompt (always)
+   - prior 2 prompts only if the latest lacks context
+3. Web agent fetches up to 5 Brave results.
+4. The front-desk model (`model_id`) answers using:
+   - memory summary/facts
+   - latest 3 prompts
+   - web sources
+5. Run the same background tasks as non-web mode.
 
 ## API
 - `GET /health`

@@ -8,10 +8,12 @@ const config = {
     process.env.SYSTEM_PROMPT ||
     'You are a helpful assistant. Use the provided memory to stay consistent and accurate.',
   DEFAULT_MODEL_ID: process.env.DEFAULT_MODEL_ID || 'llama3',
-  MEMORY_MODEL_ID: process.env.MEMORY_MODEL_ID || 'qwen2.5:14b',
+  INFO_SEEKING_MODEL_ID: process.env.INFO_SEEKING_MODEL_ID || '',
   TITLE_MODEL_ID: process.env.TITLE_MODEL_ID || '',
+  TOPIC_MODEL_ID: process.env.TOPIC_MODEL_ID || '',
+  TOPIC_MAX_WORDS: Number.parseInt(process.env.TOPIC_MAX_WORDS || '6', 10),
   TITLE_MAX_CHARS: Number.parseInt(process.env.TITLE_MAX_CHARS || '60', 10),
-  RECENT_TURNS: Number.parseInt(process.env.RECENT_TURNS || '6', 10),
+  RECENT_TURNS: Number.parseInt(process.env.RECENT_TURNS || '3', 10),
   SUMMARY_EVERY_N_TURNS: Number.parseInt(
     process.env.SUMMARY_EVERY_N_TURNS || '6',
     10
@@ -38,37 +40,10 @@ const config = {
     process.env.WEB_AGENT_TIMEOUT_MS || '120000',
     10
   ),
-  WEB_AGENT_SYSTEM_PROMPT: process.env.WEB_AGENT_SYSTEM_PROMPT || '',
-  WEB_AGENT_MODEL_ID: process.env.WEB_AGENT_MODEL_ID || '',
-  WEB_AGENT_ROUTER_MODEL_ID: process.env.WEB_AGENT_ROUTER_MODEL_ID || '',
   WEB_AGENT_PORT: Number.parseInt(process.env.WEB_AGENT_PORT || '3001', 10),
   WEB_AGENT_BIND_HOST: process.env.WEB_AGENT_BIND_HOST || '127.0.0.1',
-  WEB_AGENT_FETCH_CONCURRENCY: Number.parseInt(
-    process.env.WEB_AGENT_FETCH_CONCURRENCY || '3',
-    10
-  ),
   WEB_AGENT_MAX_RESULTS: Number.parseInt(
     process.env.WEB_AGENT_MAX_RESULTS || '5',
-    10
-  ),
-  WEB_AGENT_MAX_CHARS_EACH: Number.parseInt(
-    process.env.WEB_AGENT_MAX_CHARS_EACH || '6000',
-    10
-  ),
-  WEB_AGENT_FETCH_TIMEOUT_MS: Number.parseInt(
-    process.env.WEB_AGENT_FETCH_TIMEOUT_MS || '12000',
-    10
-  ),
-  WEB_AGENT_DYNAMIC_FETCH: ['1', 'true', 'yes', 'on'].includes(
-    String(process.env.WEB_AGENT_DYNAMIC_FETCH || '').toLowerCase()
-  ),
-  WEB_AGENT_DYNAMIC_DOMAINS: process.env.WEB_AGENT_DYNAMIC_DOMAINS || '',
-  WEB_AGENT_DYNAMIC_TIMEOUT_MS: Number.parseInt(
-    process.env.WEB_AGENT_DYNAMIC_TIMEOUT_MS || '20000',
-    10
-  ),
-  WEB_AGENT_DYNAMIC_WAIT_MS: Number.parseInt(
-    process.env.WEB_AGENT_DYNAMIC_WAIT_MS || '1000',
     10
   ),
   BRAVE_API_KEY: process.env.BRAVE_API_KEY || '',

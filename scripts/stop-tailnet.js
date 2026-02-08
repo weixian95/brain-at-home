@@ -1,9 +1,9 @@
 const { spawnSync } = require('node:child_process')
 
-function run(cmd) {
+function run(cmd, stdio = 'inherit') {
   return spawnSync(cmd, {
     shell: true,
-    stdio: 'inherit',
+    stdio,
   })
 }
 
@@ -11,6 +11,18 @@ function tryRun(cmd) {
   const result = run(cmd)
   return result.status === 0
 }
+
+function ensureOperator() {
+  const user = process.env.USER || process.env.USERNAME
+  if (!user) return false
+  if (run(`tailscale set --operator=${user}`, 'pipe').status === 0) {
+    return true
+  }
+  tryRun('sudo -v')
+  return tryRun(`sudo tailscale set --operator=${user}`)
+}
+
+ensureOperator()
 
 // Try without sudo first, then prompt with sudo if needed.
 const stopped = tryRun('tailscale serve --https=3000 localhost:3000 off')

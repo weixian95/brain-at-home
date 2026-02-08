@@ -46,10 +46,13 @@ function applyTokenBudget(messages, budgetTokens) {
   return selected.reverse()
 }
 
-function selectRecentMessages(rawMessages, recentTurns, recentTokenBudget) {
-  const limit = Math.max(0, recentTurns * 2)
-  const window = limit ? rawMessages.slice(-limit) : []
-  return applyTokenBudget(window, recentTokenBudget)
+function selectRecentUserMessages(rawMessages, recentUserCount, recentTokenBudget) {
+  if (!Array.isArray(rawMessages) || recentUserCount <= 0) return []
+  const userMessages = rawMessages.filter(
+    (message) => message && message.role === 'user' && message.content
+  )
+  const slice = userMessages.slice(-recentUserCount)
+  return applyTokenBudget(slice, recentTokenBudget)
 }
 
 function buildPromptMessages({
@@ -67,7 +70,12 @@ function buildPromptMessages({
     messages.push({ role: 'system', content: memoryBlock })
   }
 
-  const recent = selectRecentMessages(rawMessages, recentTurns, budgets.recent)
+  const recentUserCount = Math.max(0, (recentTurns || 0) - 1)
+  const recent = selectRecentUserMessages(
+    rawMessages,
+    recentUserCount,
+    budgets.recent
+  )
   for (const message of recent) {
     messages.push({ role: message.role, content: message.content })
   }
@@ -100,6 +108,7 @@ async function updateMemory({
   summaryBudget,
   factsBudget,
   inputTokenBudget,
+  timeoutMs,
 }) {
   const prunedMessages = applyTokenBudget(messagesSince, inputTokenBudget)
 
@@ -134,6 +143,7 @@ async function updateMemory({
       { role: 'user', content: userPrompt },
     ],
     stream: false,
+    timeoutMs,
   })
 
   const parsed = extractJson(response)
@@ -149,7 +159,7 @@ async function updateMemory({
 
 module.exports = {
   buildPromptMessages,
-  selectRecentMessages,
+  selectRecentUserMessages,
   shouldUpdateMemory,
   updateMemory,
 }
