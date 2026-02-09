@@ -278,6 +278,16 @@ async function handleChat(req, res) {
 
         const requestTs = Date.now()
         const messageTs = Number.isFinite(clientTs) ? clientTs : requestTs
+        broadcastChatUpdate(chatKey, {
+          type: 'message',
+          chat_id: chatId,
+          content: {
+            role: 'user',
+            content: prompt,
+            ts: messageTs,
+            message_id: messageId,
+          },
+        })
         if (useStream) {
           startStreamResponse(res)
           writeNdjson(res, {
@@ -1717,6 +1727,18 @@ async function finalizeChatTurn({
   }
 
   saveChatRecord(record)
+  const chatKey = `${record.user_id}:${record.chat_id}`
+  broadcastChatUpdate(chatKey, {
+    type: 'message',
+    chat_id: record.chat_id,
+    content: {
+      role: 'assistant',
+      content: answer,
+      ts: answerTs,
+      message_id: messageId,
+      polished: false,
+    },
+  })
   broadcastChatListUpdate('updated', record)
 
   if (deferHeavy) {
