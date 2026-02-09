@@ -25,12 +25,12 @@ function ensureOperator() {
 ensureOperator()
 
 // Try without sudo first, then prompt with sudo if needed.
-const stopped = tryRun('tailscale serve --https=3000 localhost:3000 off')
-tryRun('tailscale serve --http=3000 localhost:3000 off')
+const stopped = tryRun('tailscale serve --https=3000 127.0.0.1:3000 off')
+tryRun('tailscale serve --http=3000 127.0.0.1:3000 off')
 if (!stopped) {
   tryRun('sudo -v')
-  tryRun('sudo tailscale serve --https=3000 localhost:3000 off')
-  tryRun('sudo tailscale serve --http=3000 localhost:3000 off')
+  tryRun('sudo tailscale serve --https=3000 127.0.0.1:3000 off')
+  tryRun('sudo tailscale serve --http=3000 127.0.0.1:3000 off')
 }
 
 const statusOk = tryRun('tailscale serve status')
@@ -41,6 +41,6 @@ if (!statusOk) {
 
 // Ignore failures if processes are not running.
 tryRun('pkill -f "node server.js"')
-tryRun('pkill -f "node src/agent/server.js"')
+tryRun('pkill -f "node src/web-search/server.js"')
 
 process.exit(0)

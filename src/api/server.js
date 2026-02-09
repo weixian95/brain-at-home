@@ -21,10 +21,16 @@ const { callOllamaChat, listOllamaModels } = require('../lib/ollama')
 const { runHighLlm } = require('../lib/llm_queue')
 const { generateTopic } = require('../lib/topic')
 // Web agent routing is controlled by client input (use_web/web_search).
-const { callWebAgent, streamWebAgent } = require('../agent/client')
+const { callWebAgent, streamWebAgent } = require('../web-search/client')
 
 const store = new FileStore(config.DATA_DIR, config.CHATS_DIR)
 const chatListeners = new Map()
+const globalListeners = new Set()
+const uiState = {
+  chats: new Map(),
+  busyChats: new Set(),
+  activeChatId: '',
+}
 const SHARED_USER_ID = 'shared'
 const SEARCH_QUERY_SYSTEM_PROMPT =
   'You create search engine queries for Brave Search. ' +
@@ -81,6 +87,11 @@ const server = http.createServer(async (req, res) => {
       return
     }
 
+    if (url.pathname === '/api/stream' && req.method === 'GET') {
+      await handleGlobalStream(req, res, url)
+      return
+    }
+
     if (url.pathname === '/api/chats' && req.method === 'GET') {
       await handleListChats(req, res, url)
       return
@@ -97,6 +108,15 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname.startsWith('/api/chats/') && req.method === 'GET') {
       await handleChatRead(req, res, url)
+      return
+    }
+
+    if (
+      url.pathname.startsWith('/api/chats/') &&
+      url.pathname.endsWith('/state') &&
+      req.method === 'POST'
+    ) {
+      await handleChatStateUpdate(req, res, url)
       return
     }
 
@@ -216,9 +236,18 @@ async function handleChat(req, res) {
     const webDecision = { use: shouldUseWeb, reasons: [webReason] }
     const chatKey = `${effectiveUserId}:${chatId}`
     await withChatLock(chatKey, async () => {
-      const record = store.getOrCreateChat(effectiveUserId, chatId)
-
-    if (record.idempotency && record.idempotency[messageId]) {
+      const { record, created } = store.getOrCreateChatWithMeta(effectiveUserId, chatId)
+      if (created) {
+        broadcastChatListUpdate('added', record)
+      }
+      updateChatUiState(
+        chatId,
+        { active: true, use_web: Boolean(override), model_id: localModelId },
+        { message_id: messageId }
+      )
+      let busySet = false
+      try {
+        if (record.idempotency && record.idempotency[messageId]) {
       const cached = record.idempotency[messageId]
       const cachedAnswer = cached.answer
       const cachedSources = Array.isArray(cached.sources) ? cached.sources : []
@@ -242,33 +271,36 @@ async function handleChat(req, res) {
         topic: record.topic || '',
       })
       return
-    }
+        }
 
-    const requestTs = Date.now()
-    const messageTs = Number.isFinite(clientTs) ? clientTs : requestTs
-    if (useStream) {
-      startStreamResponse(res)
-      writeNdjson(res, {
-        stage: 'routing',
-        content: 'Selecting information acquisition strategy.',
-        done: false,
-      })
-      writeNdjson(res, {
-        stage: 'routing_decision',
-        use_web: Boolean(webDecision && webDecision.use),
-        source: 'client',
-        reason: webReason,
-        confidence: route.confidence,
-        done: false,
-      })
-      if (override && !infoSeeking) {
-        writeNdjson(res, {
-          stage: 'analysis',
-          content: 'Web search skipped for non-information prompt.',
-          done: false,
-        })
-      }
-    }
+        updateChatUiState(chatId, { busy: true }, { message_id: messageId })
+        busySet = true
+
+        const requestTs = Date.now()
+        const messageTs = Number.isFinite(clientTs) ? clientTs : requestTs
+        if (useStream) {
+          startStreamResponse(res)
+          writeNdjson(res, {
+            stage: 'routing',
+            content: 'Selecting information acquisition strategy.',
+            done: false,
+          })
+          writeNdjson(res, {
+            stage: 'routing_decision',
+            use_web: Boolean(webDecision && webDecision.use),
+            source: 'client',
+            reason: webReason,
+            confidence: route.confidence,
+            done: false,
+          })
+          if (override && !infoSeeking) {
+            writeNdjson(res, {
+              stage: 'analysis',
+              content: 'Web search skipped for non-information prompt.',
+              done: false,
+            })
+          }
+        }
 
     const budgets = {
       summary: config.SUMMARY_TOKEN_BUDGET,
@@ -609,6 +641,11 @@ async function handleChat(req, res) {
         res.end()
       }
     }
+      } finally {
+        if (busySet) {
+          updateChatUiState(chatId, { busy: false }, { message_id: messageId })
+        }
+      }
     })
   } finally {
     // no-op
@@ -1276,11 +1313,10 @@ function getFirstUserPrompt(record, fallback) {
 
 function startStreamResponse(res) {
   if (res.headersSent) return
-  res.writeHead(200, {
-    'Content-Type': 'application/x-ndjson; charset=utf-8',
-    'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive',
-  })
+  res.statusCode = 200
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-cache, no-transform')
+  res.setHeader('Connection', 'keep-alive')
 }
 
 function writeNdjson(res, payload) {
@@ -1290,17 +1326,230 @@ function writeNdjson(res, payload) {
 
 function startSseResponse(res) {
   if (res.headersSent) return
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive',
-  })
+  res.statusCode = 200
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-cache, no-transform')
+  res.setHeader('Connection', 'keep-alive')
 }
 
 function writeSse(res, event, payload) {
   if (res.writableEnded) return
   res.write(`event: ${event}\n`)
   res.write(`data: ${JSON.stringify(payload)}\n\n`)
+}
+
+function addGlobalListener(res) {
+  const entry = { res, heartbeat: null }
+  globalListeners.add(entry)
+  entry.heartbeat = setInterval(() => {
+    if (res.writableEnded) return
+    res.write(': ping\n\n')
+  }, 15000)
+  return entry
+}
+
+function removeGlobalListener(entry) {
+  if (!entry) return
+  if (entry.heartbeat) {
+    clearInterval(entry.heartbeat)
+  }
+  globalListeners.delete(entry)
+}
+
+function broadcastGlobal(event, payload) {
+  if (globalListeners.size === 0) return
+  for (const entry of globalListeners) {
+    if (entry && entry.res && !entry.res.writableEnded) {
+      writeSse(entry.res, event, payload)
+    }
+  }
+}
+
+function broadcastToAllChatListeners(event, payload) {
+  if (chatListeners.size === 0) return
+  for (const listeners of chatListeners.values()) {
+    for (const entry of listeners) {
+      if (entry && entry.res && !entry.res.writableEnded) {
+        writeSse(entry.res, event, payload)
+      }
+    }
+  }
+}
+
+function ensureChatUiState(chatId) {
+  let state = uiState.chats.get(chatId)
+  if (!state) {
+    state = {
+      chat_id: chatId,
+      use_web: null,
+      model_id: '',
+      busy: false,
+      input_disabled: false,
+      history_locked: false,
+      active: false,
+      last_message_id: '',
+      last_update_ts: 0,
+    }
+    uiState.chats.set(chatId, state)
+  }
+  return state
+}
+
+function buildChatStateSnapshot(state) {
+  if (!state) return null
+  return {
+    chat_id: state.chat_id,
+    use_web: state.use_web,
+    model_id: state.model_id || '',
+    busy: Boolean(state.busy),
+    input_disabled: Boolean(state.input_disabled),
+    history_locked: Boolean(state.history_locked),
+    active: Boolean(state.active),
+    last_message_id: state.last_message_id || '',
+    last_update_ts: state.last_update_ts || 0,
+  }
+}
+
+function getGlobalUiSnapshot() {
+  const busyChats = Array.from(uiState.busyChats)
+  const busy = busyChats.length > 0
+  const activeChatId = uiState.activeChatId || (busyChats[0] || '')
+  return {
+    active_chat_id: activeChatId,
+    busy,
+    busy_chats: busyChats,
+    input_disabled: busy,
+    history_locked: busy,
+  }
+}
+
+function getUiStateSnapshot() {
+  const chats = Array.from(uiState.chats.values())
+    .map((state) => buildChatStateSnapshot(state))
+    .filter(Boolean)
+  return {
+    global: getGlobalUiSnapshot(),
+    chats,
+  }
+}
+
+function applyActiveChatUpdate(chatId, isActive, now) {
+  const changed = new Set()
+  const prevActive = uiState.activeChatId
+  if (isActive) {
+    if (prevActive && prevActive !== chatId) {
+      const prevState = ensureChatUiState(prevActive)
+      if (prevState.active) {
+        prevState.active = false
+        prevState.last_update_ts = now
+        changed.add(prevActive)
+      }
+    }
+    uiState.activeChatId = chatId
+    const currentState = ensureChatUiState(chatId)
+    if (!currentState.active) {
+      currentState.active = true
+      currentState.last_update_ts = now
+      changed.add(chatId)
+    }
+  } else if (prevActive === chatId) {
+    uiState.activeChatId = ''
+    const currentState = ensureChatUiState(chatId)
+    if (currentState.active) {
+      currentState.active = false
+      currentState.last_update_ts = now
+      changed.add(chatId)
+    }
+  }
+  return Array.from(changed)
+}
+
+function broadcastChatState(chatId, state) {
+  const snapshot = buildChatStateSnapshot(state)
+  if (!snapshot) return
+  const payload = { chat_id: chatId, state: snapshot }
+  broadcastGlobal('chatstate', payload)
+  const chatKey = `${SHARED_USER_ID}:${chatId}`
+  const listeners = chatListeners.get(chatKey)
+  if (listeners && listeners.size) {
+    for (const entry of listeners) {
+      if (entry && entry.res && !entry.res.writableEnded) {
+        writeSse(entry.res, 'chatstate', payload)
+      }
+    }
+  }
+}
+
+function broadcastGlobalState() {
+  const payload = getGlobalUiSnapshot()
+  broadcastGlobal('globalstate', payload)
+  broadcastToAllChatListeners('globalstate', payload)
+}
+
+function updateChatUiState(chatId, updates = {}, meta = {}) {
+  const now = Date.now()
+  const state = ensureChatUiState(chatId)
+  const changedChatIds = new Set([chatId])
+
+  if (typeof updates.use_web === 'boolean') {
+    state.use_web = updates.use_web
+  }
+
+  if (typeof updates.model_id === 'string' && updates.model_id.trim()) {
+    state.model_id = updates.model_id.trim()
+  }
+
+  if (typeof updates.busy === 'boolean') {
+    state.busy = updates.busy
+    if (updates.busy) {
+      uiState.busyChats.add(chatId)
+    } else {
+      uiState.busyChats.delete(chatId)
+    }
+    if (typeof updates.input_disabled !== 'boolean') {
+      state.input_disabled = updates.busy
+    }
+    if (typeof updates.history_locked !== 'boolean') {
+      state.history_locked = updates.busy
+    }
+  }
+
+  if (typeof updates.input_disabled === 'boolean') {
+    state.input_disabled = updates.input_disabled
+  }
+
+  if (typeof updates.history_locked === 'boolean') {
+    state.history_locked = updates.history_locked
+  }
+
+  if (meta && meta.message_id) {
+    state.last_message_id = meta.message_id
+  }
+
+  state.last_update_ts = now
+
+  if (typeof updates.active === 'boolean') {
+    const activeChanges = applyActiveChatUpdate(chatId, updates.active, now)
+    for (const id of activeChanges) {
+      changedChatIds.add(id)
+    }
+  }
+
+  for (const id of changedChatIds) {
+    broadcastChatState(id, ensureChatUiState(id))
+  }
+  broadcastGlobalState()
+  return ensureChatUiState(chatId)
+}
+
+function clearChatUiState(chatId) {
+  if (!chatId) return
+  uiState.chats.delete(chatId)
+  uiState.busyChats.delete(chatId)
+  if (uiState.activeChatId === chatId) {
+    uiState.activeChatId = ''
+  }
+  broadcastGlobalState()
 }
 
 function addChatListener(chatKey, res) {
@@ -1468,6 +1717,7 @@ async function finalizeChatTurn({
   }
 
   saveChatRecord(record)
+  broadcastChatListUpdate('updated', record)
 
   if (deferHeavy) {
     return
@@ -1678,6 +1928,7 @@ async function updateTopicAndTitle({ record, prompt, messageTs, modelId, emit })
 
   if (record.title) {
     saveChatRecord(record)
+    broadcastChatListUpdate('updated', record)
     if (emit) {
       emit({
         stage: 'title',
@@ -1700,6 +1951,7 @@ async function updateTopicAndTitle({ record, prompt, messageTs, modelId, emit })
     modelId: topicModelId,
   })
   saveChatRecord(record)
+  broadcastChatListUpdate('updated', record)
   if (emit && record.topic) {
     emit({
       stage: 'topic',
@@ -1910,7 +2162,25 @@ function isTooSimilarTitle(title, prompt) {
 
 async function handleListChats(_req, res) {
   const userId = SHARED_USER_ID
-  const chats = store.listChatsForUser(userId).map((chat) => ({
+  const chats = listChatSummaries(userId)
+  respondJson(res, 200, { chats })
+}
+
+async function handleGlobalStream(req, res) {
+  const userId = SHARED_USER_ID
+  startSseResponse(res)
+  writeSse(res, 'ready', { ok: true, user_id: userId })
+  writeSse(res, 'chatlist', { chats: listChatSummaries(userId) })
+  writeSse(res, 'uistate', getUiStateSnapshot())
+
+  const entry = addGlobalListener(res)
+  const cleanup = () => removeGlobalListener(entry)
+  req.on('close', cleanup)
+  res.on('close', cleanup)
+}
+
+function listChatSummaries(userId) {
+  return store.listChatsForUser(userId).map((chat) => ({
     chat_id: chat.chat_id,
     title: chat.title || 'New chat',
     topic: chat.topic || '',
@@ -1922,7 +2192,39 @@ async function handleListChats(_req, res) {
     last_topic_ts: chat.last_topic_ts,
     raw_count: chat.raw_count,
   }))
-  respondJson(res, 200, { chats })
+}
+
+function buildChatSummaryFromRecord(record) {
+  if (!record) return null
+  return {
+    chat_id: record.chat_id,
+    title: record.title || 'New chat',
+    topic: record.topic || '',
+    summary: record.summary || '',
+    facts: Array.isArray(record.facts) ? record.facts : [],
+    last_updated_ts: getLastUpdatedTs(record),
+    last_message_ts: getLastMessageTs(record),
+    last_summary_ts: getLastSummaryTs(record),
+    last_topic_ts: Number.isFinite(record.last_topic_ts) ? record.last_topic_ts : 0,
+    raw_count: Array.isArray(record.raw_messages) ? record.raw_messages.length : 0,
+  }
+}
+
+function broadcastChatListUpdate(type, recordOrPayload) {
+  if (!type) return
+  let payload = null
+  if (type === 'deleted') {
+    const chatId =
+      recordOrPayload && typeof recordOrPayload.chat_id === 'string'
+        ? recordOrPayload.chat_id
+        : ''
+    payload = { type: 'deleted', chat_id: chatId }
+  } else {
+    const summary = buildChatSummaryFromRecord(recordOrPayload)
+    if (!summary) return
+    payload = { type, chat: summary }
+  }
+  broadcastGlobal('chatlistupdate', payload)
 }
 
 async function handleChatRead(_req, res, url) {
@@ -1937,7 +2239,10 @@ async function handleChatRead(_req, res, url) {
     return
   }
 
-  const record = store.getOrCreateChat(userId, chatId)
+  const { record, created } = store.getOrCreateChatWithMeta(userId, chatId)
+  if (created) {
+    broadcastChatListUpdate('added', record)
+  }
 
   const title = record.title || 'New chat'
 
@@ -1997,13 +2302,22 @@ async function handleChatStream(req, res, url) {
     return
   }
 
-  const record = store.getOrCreateChat(userId, chatId)
+  const { record, created } = store.getOrCreateChatWithMeta(userId, chatId)
+  if (created) {
+    broadcastChatListUpdate('added', record)
+  }
 
   startSseResponse(res)
   writeSse(res, 'ready', { ok: true, chat_id: chatId })
 
   const chatKey = `${userId}:${chatId}`
   const entry = addChatListener(chatKey, res)
+
+  writeSse(res, 'chatstate', {
+    chat_id: chatId,
+    state: buildChatStateSnapshot(ensureChatUiState(chatId)),
+  })
+  writeSse(res, 'globalstate', getGlobalUiSnapshot())
 
   const currentTitle = record.title || ''
   const currentTopic = record.topic || ''
@@ -2027,6 +2341,61 @@ async function handleChatStream(req, res, url) {
   res.on('close', cleanup)
 }
 
+async function handleChatStateUpdate(req, res, url) {
+  const userId = SHARED_USER_ID
+
+  let payload
+  try {
+    payload = await readJsonBody(req, config.MAX_BODY_BYTES)
+  } catch (error) {
+    respondJson(res, 400, { error: 'Invalid JSON body.' })
+    return
+  }
+  if (!payload || typeof payload !== 'object') {
+    respondJson(res, 400, { error: 'Missing request body.' })
+    return
+  }
+
+  const path = url.pathname.replace(/^\/api\/chats\//, '')
+  const parts = path.split('/').filter(Boolean)
+  const chatId = decodeURIComponent(parts[0] || '')
+  const action = parts[1]
+
+  if (!isNonEmptyString(chatId) || action !== 'state') {
+    respondJson(res, 404, { error: 'Not found.' })
+    return
+  }
+
+  const { record, created } = store.getOrCreateChatWithMeta(userId, chatId)
+  if (created) {
+    broadcastChatListUpdate('added', record)
+  }
+
+  const useWeb = parseBooleanOverride(
+    typeof payload?.use_web !== 'undefined' ? payload.use_web : payload?.web_search
+  )
+  const active = parseBooleanOverride(payload?.active)
+  const modelId =
+    payload && typeof payload.model_id === 'string'
+      ? payload.model_id
+      : typeof payload.model === 'string'
+        ? payload.model
+        : ''
+
+  const updates = {}
+  if (useWeb !== null) updates.use_web = useWeb
+  if (active !== null) updates.active = active
+  if (modelId) updates.model_id = modelId
+
+  if (Object.keys(updates).length === 0) {
+    respondJson(res, 400, { error: 'No valid state updates provided.' })
+    return
+  }
+
+  const state = updateChatUiState(chatId, updates)
+  respondJson(res, 200, { ok: true, chat_id: chatId, state })
+}
+
 async function handleChatDelete(_req, res, url) {
   const userId = SHARED_USER_ID
 
@@ -2044,6 +2413,11 @@ async function handleChatDelete(_req, res, url) {
     respondJson(res, 404, { error: 'Chat not found.' })
     return
   }
+
+  clearChatUiState(chatId)
+  broadcastChatListUpdate('deleted', { chat_id: chatId })
+  const chatKey = `${userId}:${chatId}`
+  broadcastChatUpdate(chatKey, { type: 'deleted', chat_id: chatId })
 
   respondJson(res, 200, { ok: true, chat_id: chatId })
 }

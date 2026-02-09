@@ -40,8 +40,12 @@ class FileStore {
   }
 
   getOrCreateChat(userId, chatId) {
+    return this.getOrCreateChatWithMeta(userId, chatId).record
+  }
+
+  getOrCreateChatWithMeta(userId, chatId) {
     const existing = this.loadChat(userId, chatId)
-    if (existing) return existing
+    if (existing) return { record: existing, created: false }
     const record = {
       user_id: userId,
       chat_id: chatId,
@@ -57,7 +61,7 @@ class FileStore {
       idempotency: {},
     }
     this.saveChat(record)
-    return record
+    return { record, created: true }
   }
 
   listChatsForUser(userId) {

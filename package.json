@@ -9,9 +9,7 @@
   },
   "scripts": {
     "start": "node server.js",
-    "start:agent": "node src/agent/server.js",
-    "start:tailnet": "node server.js & sudo tailscale serve --bg --https=3000 localhost:3000 && sudo tailscale serve status",
-    "start:tailnet:agent": "npm run start:agent & npm run start:tailnet",
+    "start:tailnet": "node server.js & api_pid=$!; node src/web-search/server.js & (tailscale serve --bg --https=3000 127.0.0.1:3000 || sudo tailscale serve --bg --https=3000 127.0.0.1:3000); (tailscale serve status || sudo tailscale serve status); wait $api_pid",
     "stop:tailnet": "node scripts/stop-tailnet.js"
   },
   "engines": {

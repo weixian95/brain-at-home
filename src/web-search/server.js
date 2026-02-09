@@ -160,11 +160,10 @@ function isStreamRequested(value) {
 
 function startStreamResponse(res) {
   if (res.headersSent) return
-  res.writeHead(200, {
-    'Content-Type': 'application/x-ndjson; charset=utf-8',
-    'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive',
-  })
+  res.statusCode = 200
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-cache, no-transform')
+  res.setHeader('Connection', 'keep-alive')
 }
 
 function writeNdjson(res, payload) {
